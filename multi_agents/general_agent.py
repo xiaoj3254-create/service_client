@@ -105,6 +105,7 @@ class GeneralAgent(BaseAgent):
         """匹配查询中的服务信息"""
         query_lower = query.lower()
         matched_info = []
+        matched_categories = set()
 
         # 精确匹配服务类型
         for category, services in self.service_database.items():
@@ -114,18 +115,21 @@ class GeneralAgent(BaseAgent):
                 for service, description in services.items():
                     info_text += f"• {service}：{description}\n"
                 matched_info.append(info_text)
+                matched_categories.add(category)
 
         # 如果没有精确匹配，尝试关键词匹配
         if not matched_info:
             for category, services in self.service_database.items():
+                if category in matched_categories:
+                    continue
                 if any(keyword in query_lower for keyword in ["时间", "联系", "服务", "营业", "电话", "邮箱"]):
-                    if category not in [info.split('【')[1].split('】')[0] for info in matched_info]:
-                        info_text = f"""相关信息：{category}\n"""
-                        # 只显示前2项服务
-                        for i, (service, description) in enumerate(services.items()):
-                            if i < 2:
-                                info_text += f"• {service}：{description}\n"
-                        info_text += "..."
-                        matched_info.append(info_text)
+                    info_text = f"""相关信息：{category}\n"""
+                    # 只显示前2项服务
+                    for i, (service, description) in enumerate(services.items()):
+                        if i < 2:
+                            info_text += f"• {service}：{description}\n"
+                    info_text += "..."
+                    matched_info.append(info_text)
+                    matched_categories.add(category)
 
         return "\n".join(matched_info) if matched_info else ""

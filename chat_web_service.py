@@ -221,7 +221,10 @@ def ensure_assistant_exists() -> bool:
 def ensure_thread_exists(client_session_id: Optional[str] = None) -> bool:
     """
     确保有可用的 LangGraph 线程。
-    client_session_id: 前端传入的 session_id；若是合法线程 ID 则复用。"""
+    - client_session_id 是已存在的合法线程 ID：复用该线程（继续/切换历史会话）。
+    - client_session_id 为空、'default' 或非法：一律【新建】线程，
+      不复用全局缓存，保证每次“新建对话”相互隔离。
+    """
     global _current_thread_id
 
     sid = client_session_id
@@ -236,13 +239,8 @@ def ensure_thread_exists(client_session_id: Optional[str] = None) -> bool:
                 return True
             else:
                 print(f"⚠️ 会话ID {sid} 不是有效的LangGraph线程ID，将创建新线程")
-                sid = None
         except Exception as e:
-            print(f"⚠️ 验证会话ID {sid} 时出错: {e}")
-            sid = None
-
-    if _current_thread_id:
-        return True
+            print(f"⚠️ 验证会话ID {sid} 时出错: {e}，将创建新线程")
 
     try:
         response = requests.post(

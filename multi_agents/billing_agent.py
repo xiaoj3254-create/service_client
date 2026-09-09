@@ -105,6 +105,7 @@ class BillingAgent(BaseAgent):
         """匹配查询中的账单信息"""
         query_lower = query.lower()
         matched_info = []
+        matched_categories = set()
 
         # 精确匹配账单类型
         for category, policies in self.billing_database.items():
@@ -114,18 +115,21 @@ class BillingAgent(BaseAgent):
                 for policy, description in policies.items():
                     info_text += f"• {policy}：{description}\n"
                 matched_info.append(info_text)
+                matched_categories.add(category)
 
         # 如果没有精确匹配，尝试关键词匹配
         if not matched_info:
             for category, policies in self.billing_database.items():
+                if category in matched_categories:
+                    continue
                 if any(keyword in query_lower for keyword in ["退款", "发票", "支付", "账单", "价格"]):
-                    if category not in [info.split('【')[1].split('】')[0] for info in matched_info]:
-                        info_text = f"""相关服务：{category}\n"""
-                        # 只显示前2项政策
-                        for i, (policy, description) in enumerate(policies.items()):
-                            if i < 2:
-                                info_text += f"• {policy}：{description}\n"
-                        info_text += "..."
-                        matched_info.append(info_text)
+                    info_text = f"""相关服务：{category}\n"""
+                    # 只显示前2项政策
+                    for i, (policy, description) in enumerate(policies.items()):
+                        if i < 2:
+                            info_text += f"• {policy}：{description}\n"
+                    info_text += "..."
+                    matched_info.append(info_text)
+                    matched_categories.add(category)
 
         return "\n".join(matched_info) if matched_info else ""

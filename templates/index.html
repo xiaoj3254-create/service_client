@@ -1465,7 +1465,8 @@
             const btn = document.getElementById('sendBtn');
             if (!ta || !btn) return;
             const trimmed = ta.value.trim();
-            const canSend = trimmed.length > 0 && !!currentSessionId && !isTyping;
+            // currentSessionId 为 null 表示“尚未创建线程的新对话”，首条消息发送时后端会自动建线程
+            const canSend = trimmed.length > 0 && !isTyping;
             btn.classList.toggle('input-send-ready', canSend);
         }
 
@@ -1670,12 +1671,15 @@
             });
         }
 
-        // 创建新会话（无气泡引导，居中欢迎层由 DOM 提示）
+        // 创建新会话：清空对话视图；真实 LangGraph 线程在首条消息发送时由后端创建并回传
         function createNewSession() {
-            currentSessionId = 'web_' + Date.now();
+            currentSessionId = null;
             clearChatContainer();
             refreshSessionList();
             updateComposerSendReady();
+            updateChatEmptyVisibility();
+            const ta = document.getElementById('messageInput');
+            if (ta) ta.focus();
         }
 
         // 刷新会话列表
@@ -1877,7 +1881,7 @@
             const input = document.getElementById('messageInput');
             const message = input.value.trim();
 
-            if (!message || isTyping || !currentSessionId) return;
+            if (!message || isTyping) return;
 
             // 添加用户消息到界面
             addMessage('user', message);
@@ -1931,6 +1935,13 @@
                 } else {
                     addMessage('assistant', '抱歉，系统返回了空响应，请稍后重试。');
                     console.warn('聊天API返回空响应:', data);
+                }
+
+                // 首条消息后后端返回真实 LangGraph 线程ID：
+                // 采用该ID，使同一对话后续消息继续写入同一线程，侧边栏也能正确高亮
+                if (data.thread_id && data.thread_id !== currentSessionId) {
+                    currentSessionId = data.thread_id;
+                    updateComposerSendReady();
                 }
 
                 // 刷新会话列表

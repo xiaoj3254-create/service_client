@@ -105,6 +105,7 @@ class TechAgent(BaseAgent):
         """匹配查询中的技术信息"""
         query_lower = query.lower()
         matched_info = []
+        matched_categories = set()
 
         # 精确匹配技术类型
         for category, solutions in self.tech_database.items():
@@ -114,18 +115,21 @@ class TechAgent(BaseAgent):
                 for issue, solution in solutions.items():
                     info_text += f"• {issue}：{solution}\n"
                 matched_info.append(info_text)
+                matched_categories.add(category)
 
         # 如果没有精确匹配，尝试关键词匹配
         if not matched_info:
             for category, solutions in self.tech_database.items():
+                if category in matched_categories:
+                    continue
                 if any(keyword in query_lower for keyword in ["问题", "故障", "无法", "怎么", "怎么办", "技术支持"]):
-                    if category not in [info.split('【')[1].split('】')[0] for info in matched_info]:
-                        info_text = f"""相关解决方案：{category}\n"""
-                        # 只显示前2项解决方案
-                        for i, (issue, solution) in enumerate(solutions.items()):
-                            if i < 2:
-                                info_text += f"• {issue}：{solution}\n"
-                        info_text += "..."
-                        matched_info.append(info_text)
+                    info_text = f"""相关解决方案：{category}\n"""
+                    # 只显示前2项解决方案
+                    for i, (issue, solution) in enumerate(solutions.items()):
+                        if i < 2:
+                            info_text += f"• {issue}：{solution}\n"
+                    info_text += "..."
+                    matched_info.append(info_text)
+                    matched_categories.add(category)
 
         return "\n".join(matched_info) if matched_info else ""

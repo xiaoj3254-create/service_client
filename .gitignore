@@ -359,6 +359,10 @@ secrets.json
 .env.local
 .env.production
 
+# Local documentation
+新建会话全链路追踪.md
+运行修复记录.md
+
 # LangGraph specific
 .langgraph/
 langgraph_cache/
