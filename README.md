@@ -22,17 +22,14 @@
 
 ## 运行效果
 
-### 首页
-
-![首页](./doc/chat-index.jpg)
 
 ### 多轮对话
 
-![多轮对话](./doc/chat-his.jpg)
+![多轮对话](./doc/cus_fro.png)
 
 ### 工作流
 
-![工作流](./doc/chat-graph.jpg)
+![工作流](./doc/studio.png)
 
 ## 项目结构
 
