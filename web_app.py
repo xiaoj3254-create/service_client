@@ -5,8 +5,10 @@
 """
 
 import os
+import base64
+import binascii
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -33,6 +35,41 @@ app = Flask(__name__)
 # Flask 配置
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key-here")
 app.config['SESSION_TYPE'] = 'filesystem'
+
+# 客户图片限制：base64 解码后最大 5MB
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def validate_image_data(image: Any) -> Tuple[Optional[str], Optional[str]]:
+    """
+    校验前端上传的图片 data URL。
+    合法返回 (data_url, None)；无图片返回 (None, None)；非法返回 (None, 错误信息)。
+    """
+    if image is None or image == '':
+        return None, None
+    if not isinstance(image, str) or not image.startswith('data:image/'):
+        return None, '图片格式无效，仅支持 data URL 图片'
+
+    # 形如 data:image/png;base64,xxxx
+    try:
+        header, b64part = image.split(',', 1)
+    except ValueError:
+        return None, '图片数据格式错误'
+
+    if 'base64' not in header:
+        return None, '图片必须为 base64 编码'
+
+    try:
+        raw = base64.b64decode(b64part, validate=True)
+    except (binascii.Error, ValueError):
+        return None, '图片 base64 解码失败'
+
+    if len(raw) == 0:
+        return None, '图片内容为空'
+    if len(raw) > MAX_IMAGE_BYTES:
+        return None, f'图片过大，解码后不能超过 {MAX_IMAGE_BYTES // (1024 * 1024)}MB'
+
+    return image, None
 
 
 # --- Flask session 内的本地对话占位（主页模板可能使用）---
@@ -68,7 +105,13 @@ def chat():
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
 
-        ai_text, err_msg, http_code = run_chat_sync(user_message, client_session_id)
+        image_data, img_err = validate_image_data(data.get('image'))
+        if img_err:
+            return jsonify({'error': img_err}), 400
+
+        ai_text, err_msg, http_code = run_chat_sync(
+            user_message, client_session_id, image=image_data
+        )
         if err_msg:
             return jsonify({'error': err_msg}), http_code or 500
 
@@ -93,8 +136,12 @@ def chat_stream():
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
 
+        image_data, img_err = validate_image_data(data.get('image'))
+        if img_err:
+            return jsonify({'error': img_err}), 400
+
         return Response(
-            stream_chat_events(user_message, client_session_id),
+            stream_chat_events(user_message, client_session_id, image=image_data),
             mimetype='text/event-stream'
         )
 

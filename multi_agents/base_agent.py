@@ -5,6 +5,7 @@
 
 from typing import Dict, List, Any, Optional
 from abc import ABC, abstractmethod
+from langchain_core.messages import HumanMessage
 from session_manager import LangChainSessionManager
 
 
@@ -23,6 +24,19 @@ class BaseAgent(ABC):
     def set_session_manager(self, session_manager: LangChainSessionManager):
         """设置会话管理器"""
         self.session_manager = session_manager
+
+    def _build_human_message(self, text: str, state: Optional[Dict[str, Any]] = None) -> HumanMessage:
+        """
+        构造用户消息：若 state 中含客户上传的图片（customer_image，data URL），
+        则构造 OpenAI 兼容的多模态消息（text + image_url），否则为纯文本消息。
+        """
+        image = (state or {}).get("customer_image")
+        if image:
+            return HumanMessage(content=[
+                {"type": "text", "text": str(text)},
+                {"type": "image_url", "image_url": {"url": image}},
+            ])
+        return HumanMessage(content=text)
 
     @abstractmethod
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:

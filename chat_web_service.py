@@ -55,6 +55,10 @@ def append_turn_from_state(conversation_history: List[Dict[str, Any]], msg: Dict
     ts = msg.get("timestamp")
     if ts is not None and ts != "":
         entry["timestamp"] = ts
+    # 客户上传的图片（data URL）随轮次透传，供前端历史回显
+    image = msg.get("image")
+    if image:
+        entry["image"] = image
     conversation_history.append(entry)
 
 
@@ -310,6 +314,7 @@ def fetch_sessions_list() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]
 
             message_count = 0
             last_user_question = ""
+            search_text = ""
             try:
                 state_response = requests.get(
                     f"{LANGGRAPH_API_URL}/threads/{thread_id}/state",
@@ -320,14 +325,23 @@ def fetch_sessions_list() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]
                     parsed_hist = conversation_history_from_state_data(state_data)
                     last_user_question = last_user_question_from_history(parsed_hist)
                     message_count = _message_count_from_state_data(state_data)
+                    # 全部用户消息拼接，供侧栏搜索做前端包含匹配（限长 1000 字符）
+                    user_texts = [
+                        str(m.get("content", "")).strip()
+                        for m in parsed_hist
+                        if m.get("is_user") and str(m.get("content", "")).strip()
+                    ]
+                    search_text = "\n".join(user_texts)[:1000]
             except Exception:
                 message_count = 0
+                search_text = ""
 
             sessions.append({
                 "session_id": thread_id,
                 "created_at": created_at,
                 "message_count": message_count,
                 "last_user_question": last_user_question,
+                "search_text": search_text,
             })
 
         return sessions, None
@@ -411,10 +425,15 @@ def clear_thread_and_create_new(thread_id: str) -> Tuple[Optional[str], Optional
 # 一次聊天运行（阻塞轮询）
 # -----------------------------------------------------------------------------
 
-def run_chat_sync(user_message: str, client_session_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+def run_chat_sync(
+    user_message: str,
+    client_session_id: Optional[str] = None,
+    image: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """
     在当前线程上提交一轮用户消息并等待完成。
     client_session_id: 前端传入的会话 ID（可为 LangGraph 线程 ID）。
+    image: 可选的客户图片 data URL（"data:image/...;base64,..."），随输入传给工作流。
     返回 (ai_text, error_text, http_status_optional)。
     """
     global _assistant_id, _current_thread_id
@@ -430,21 +449,26 @@ def run_chat_sync(user_message: str, client_session_id: Optional[str] = None) ->
 
     assert _assistant_id and _current_thread_id
 
+    # 工作流输入（含可选客户图片）
+    run_input: Dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": user_message.strip()
+            }
+        ],
+        "customer_query": user_message.strip(),
+        "session_id": _current_thread_id
+    }
+    if image:
+        run_input["customer_image"] = image
+
     try:
         run_resp = requests.post(
             f"{LANGGRAPH_API_URL}/threads/{_current_thread_id}/runs",
             json={
                 "assistant_id": _assistant_id,
-                "input": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": user_message.strip()
-                        }
-                    ],
-                    "customer_query": user_message.strip(),
-                    "session_id": _current_thread_id
-                }
+                "input": run_input
             },
             timeout=30
         )
@@ -503,9 +527,14 @@ def run_chat_sync(user_message: str, client_session_id: Optional[str] = None) ->
         return None, f'内部错误: {str(e)}', 500
 
 
-def stream_chat_events(user_message: str, client_session_id: Optional[str] = None) -> Iterable[str]:
+def stream_chat_events(
+    user_message: str,
+    client_session_id: Optional[str] = None,
+    image: Optional[str] = None,
+) -> Iterable[str]:
     """
     生成 SSE data 行（含末尾 [DONE]），供 Flask Response 逐块写出。
+    image: 可选的客户图片 data URL。
     """
     global _assistant_id, _current_thread_id
 
@@ -526,16 +555,21 @@ def stream_chat_events(user_message: str, client_session_id: Optional[str] = Non
 
     assert _assistant_id is not None and _current_thread_id is not None
 
+    # 工作流输入（含可选客户图片）
+    stream_run_input: Dict[str, Any] = {
+        "messages": [{"role": "user", "content": user_message.strip()}],
+        "customer_query": user_message.strip(),
+        "session_id": _current_thread_id
+    }
+    if image:
+        stream_run_input["customer_image"] = image
+
     try:
         response = requests.post(
             f"{LANGGRAPH_API_URL}/threads/{_current_thread_id}/runs",
             json={
                 "assistant_id": _assistant_id,
-                "input": {
-                    "messages": [{"role": "user", "content": user_message.strip()}],
-                    "customer_query": user_message.strip(),
-                    "session_id": _current_thread_id
-                }
+                "input": stream_run_input
             },
             timeout=30
         )

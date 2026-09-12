@@ -4,7 +4,7 @@
 """
 
 from typing import Dict, List, Any
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 from .base_agent import BaseAgent
 
 class TechAgent(BaseAgent):
@@ -83,9 +83,9 @@ class TechAgent(BaseAgent):
 {matched_info}
 
 当前查询：{customer_query}"""
-            messages.append(HumanMessage(content=tech_context))
+            messages.append(self._build_human_message(tech_context, state))
         else:
-            messages.append(HumanMessage(content=customer_query))
+            messages.append(self._build_human_message(customer_query, state))
 
         # 调用LLM
         try:

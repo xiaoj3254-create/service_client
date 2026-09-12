@@ -55,6 +55,9 @@ class AgentState(TypedDict):
     memory: Optional[BaseChatMessageHistory]
     # 由图 checkpointer 持久化，跨 LangGraph 工作进程仍可续聊（内存 session_manager 无法做到）
     persisted_dialogue: List[Any]
+    # 客户上传的图片（data URL，如 "data:image/jpeg;base64,..."）；无图时为 None
+    # 当前支持单图；如未来扩展多图，可改为 List[str]
+    customer_image: Optional[str]
 
 # OpenAI兼容API客户端类
 class OpenAICompatibleClient:
@@ -81,6 +84,8 @@ class OpenAICompatibleClient:
     def invoke(self, messages):
         """调用OpenAI兼容API"""
         # 格式化消息
+        # 注意：msg.content 为 list 时是多模态消息（含 image_url 片段），
+        # 结构本身即 OpenAI 兼容协议格式（mimo-v2.5 图片理解），需原样透传不可转字符串。
         formatted_messages = []
         for msg in messages:
             if hasattr(msg, 'content'):
@@ -198,29 +203,35 @@ def get_llm():
             _llm_instance = None
     return _llm_instance
 
-# 初始化智能体
-def initialize_agents():
-    """初始化所有智能体"""
-    agents = {
-        "product_agent": ProductAgent(),
-        "tech_agent": TechAgent(),
-        "billing_agent": BillingAgent(),
-        "complaint_agent": ComplaintAgent(),
-        "general_agent": GeneralAgent()
-    }
+# 智能体类映射（按需实例化：一次路由只创建实际需要的那一个智能体）
+_AGENT_CLASSES = {
+    "product_agent": ProductAgent,
+    "tech_agent": TechAgent,
+    "billing_agent": BillingAgent,
+    "complaint_agent": ComplaintAgent,
+    "general_agent": GeneralAgent,
+}
 
-    # 为每个智能体设置LLM和会话管理器
-    for agent in agents.values():
-        agent.set_llm(get_llm())  # 延迟获取LLM
+# 已实例化的智能体缓存（同进程多次对话复用，避免重复创建）
+_agent_instances: Dict[str, Any] = {}
+
+def get_agent(agent_name: str):
+    """按需获取智能体实例（首次调用时创建并缓存，后续复用）"""
+    if agent_name not in _agent_instances:
+        cls = _AGENT_CLASSES.get(agent_name)
+        if cls is None:
+            return None
+        agent = cls()
+        agent.set_llm(get_llm())
         agent.set_session_manager(default_session_manager)
-
-    return agents
+        _agent_instances[agent_name] = agent
+    return _agent_instances[agent_name]
 
 # 定义查询分类节点
 def classify_query_node(state: AgentState) -> AgentState:
     """Classify customer query"""
     try:
-        cfg = get_config()
+        cfg = get_config()  # 当前 graph 运行时的 `RunnableConfig` 对象
         tid = (cfg.get("configurable") or {}).get("thread_id")
         if tid:
             state["session_id"] = str(tid)
@@ -250,6 +261,10 @@ def classify_query_node(state: AgentState) -> AgentState:
     if "messages" not in state:
         state["messages"] = []
 
+    # 客户图片（data URL）；由 run input 传入，无图时为 None
+    if "customer_image" not in state:
+        state["customer_image"] = None
+
     # 获取必需字段
     customer_query = state.get("customer_query", "")
     session_id = state["session_id"]
@@ -278,13 +293,26 @@ def classify_query_node(state: AgentState) -> AgentState:
     state["query_type"] = query_type
     state["tools_used"].append("query_classification")
 
-    # 写入由 checkpointer 持久化的对话（用户轮次）
+    # 根据 query_type 设置 next_agent（条件边的路由依据）
+    QUERY_TYPE_TO_AGENT = {
+        "product_info": "product_agent",
+        "technical_support": "tech_agent",
+        "billing": "billing_agent",
+        "complaint": "complaint_agent",
+        "general_inquiry": "general_agent",
+    }
+    state["next_agent"] = QUERY_TYPE_TO_AGENT.get(query_type, "")
+
+    # 写入由 checkpointer 持久化的对话（用户轮次；含图片则一并存入，供历史回显）
     pd = list(state.get("persisted_dialogue") or [])
-    pd.append({
+    user_turn = {
         "content": str(customer_query),
         "is_user": True,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    }
+    if state.get("customer_image"):
+        user_turn["image"] = state["customer_image"]
+    pd.append(user_turn)
     state["persisted_dialogue"] = pd
 
     # 同步到内存 session_manager（仅同进程有效；可选）
@@ -297,6 +325,7 @@ def classify_query_node(state: AgentState) -> AgentState:
     if state["query_type"] == "out_of_scope":
         state["response"] = OUT_OF_SCOPE_REPLY
         state["current_agent"] = "智能客服"
+        state["next_agent"] = "final_response"
         pd_oos = list(state.get("persisted_dialogue") or [])
         pd_oos.append({
             "content": OUT_OF_SCOPE_REPLY,
@@ -317,8 +346,7 @@ def classify_query_node(state: AgentState) -> AgentState:
 def create_agent_node(agent_name: str):
     """创建智能体处理节点"""
     def agent_node(state: AgentState) -> AgentState:
-        agents = initialize_agents()
-        agent = agents.get(agent_name)
+        agent = get_agent(agent_name)
         if agent:
             # 获取会话上下文
             session_id = state["session_id"]
@@ -363,6 +391,8 @@ def final_response_node(state: AgentState) -> AgentState:
     response = state["response"]
 
     state["response"] = f"【{current_agent}'s Response】\n{response}"
+    # 路由已完成，清空 next_agent 避免残留上一个智能体名称
+    state["next_agent"] = ""
     return state
 
 # 图表入口点
@@ -388,17 +418,17 @@ def make_graph():
     # 设置入口点
     workflow.set_entry_point("classify_query")
 
-    # 添加条件边（根据查询类型路由到不同智能体）
+    # classify_query → 各智能体：根据 next_agent 路由（next_agent 在分类节点内设置）
     workflow.add_conditional_edges(
         "classify_query",
-        lambda x: x.get("query_type", ""),  # 添加默认值，避免KeyError
+        lambda x: x.get("next_agent", "") or "general_agent",
         {
-            "product_info": "product_agent",
-            "technical_support": "tech_agent",
-            "billing": "billing_agent",
-            "complaint": "complaint_agent",
-            "general_inquiry": "general_agent",
-            "out_of_scope": "final_response",
+            "product_agent": "product_agent",
+            "tech_agent": "tech_agent",
+            "billing_agent": "billing_agent",
+            "complaint_agent": "complaint_agent",
+            "general_agent": "general_agent",
+            "final_response": "final_response",
         }
     )
 

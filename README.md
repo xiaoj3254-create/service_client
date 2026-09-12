@@ -150,6 +150,7 @@ langgraph dev
 
 ```bash
 # 终端 1：LangGraph 服务
+($env:PYTHONUTF8=1)
 langgraph dev --port 2024 --host 127.0.0.1 --no-browser
 
 # 终端 2：Flask Web 应用
