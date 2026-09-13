@@ -24,18 +24,6 @@ FLASK_SECRET_KEY=your-secret-key-here
 
 # ===== Notes =====
 
-# 1. API key
-# Sign up at https://api.siliconflow.cn and create an API key
-
-# 2. Model choice
-# Examples:
-# - Qwen/QwQ-32B (recommended, strongest)
-# - Qwen/Qwen3-8B (good cost/performance)
-# - Qwen/Qwen3-14B (better quality)
-# - Qwen/Qwen3-32B (highest quality)
-# - Qwen/Qwen2.5-7B (lightweight)
-# - Qwen/Qwen2.5-14B (balanced)
-
 # 3. Optional overrides
 # To change timeout or retries, edit e.g.:
 # HTTP_TIMEOUT=60

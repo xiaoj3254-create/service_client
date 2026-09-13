@@ -1,18 +1,6 @@
-<div align="center">
+
 
 # 多智能体客服系统
-
-</div>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-yellow.svg" alt="License Apache 2.0"></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.13-blue.svg" alt="Python 3.13"></a>
-  <a href="https://flask.palletsprojects.com/"><img src="https://img.shields.io/badge/Flask-≥2.3-339933.svg" alt="Flask"></a>
-  <a href="https://python.langchain.com/"><img src="https://img.shields.io/badge/langchain--core-≥0.3-green.svg" alt="langchain-core"></a>
-  <a href="https://github.com/langchain-ai/langgraph"><img src="https://img.shields.io/badge/LangGraph-≥0.2-purple.svg" alt="LangGraph"></a>
-</p>
-
-<p align="center"><em>模块化多智能体路由 · Flask Web 前台 · LangGraph 会话编排</em></p>
 
 ---
 
@@ -20,16 +8,6 @@
 
 基于 LangGraph 构建的多智能体客服系统，支持产品咨询、技术支持、账单处理、投诉处理等多种业务场景。系统采用模块化设计，每个智能体独立运行，通过条件路由将客户查询分发至对应的专业智能体。
 
-## 运行效果
-
-
-### 多轮对话
-
-![多轮对话](./doc/cus_fro.png)
-
-### 工作流
-
-![工作流](./doc/studio.png)
 
 ## 项目结构
 

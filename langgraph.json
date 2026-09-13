@@ -1,16 +1,16 @@
 {
   "dependencies": ["."],                                    
   "graphs": {                                               
-    "customer_service": "./multi_agent_customer_service.py:make_graph"
+    "customer_service": "./multi_agent_customer_service.py:build_workflow"
   },
   "env": "./.env",                                          
-  "python_version": "3.13",                                 
+  "python_version": "3.11",                                 
   "base_image": "langchain/langgraph-api:0.2",             
   "workflow": {                                             
     "name": "多智能体客服系统",
     "description": "基于LangGraph的多智能体客服系统，支持产品咨询、技术支持、账单处理、投诉处理等",
     "entry_point": "classify_query",
-    "nodes": {                                             
+    "nodes": {                                              
       "classify_query": {
         "type": "function",
         "description": "分类客户查询类型",
@@ -29,7 +29,7 @@
       }
     },
     "edges": {                                              
-      "conditional": {                                      
+      "conditional": {                                       
         "classify_query": {
           "product_info": "product_agent",
           "technical_support": "tech_agent",
@@ -38,7 +38,7 @@
           "general_inquiry": "general_agent"
         }
       },
-      "direct": [                                             
+      "direct": [                                            
         ["product_agent", "final_response"],
         ["tech_agent", "final_response"],
         ["billing_agent", "final_response"],
@@ -48,11 +48,11 @@
     },
     "end_point": "final_response"
   },
-  "store": {                                               
+  "store": {                                                
     "ttl": {
       "refresh_on_read": true,                              
       "sweep_interval_minutes": 60,                         
-      "default_ttl": 10080                                 
+      "default_ttl": 10080                                  
     }
   },
   "checkpointer": {                                         
@@ -62,8 +62,8 @@
       "default_ttl": 43200                                  
     }
   },
-  "http": {                                                
-    "port": 8123,                                          
-    "host": "0.0.0.0"                                    
+  "http": {                                                 
+    "port": 8123,                                           
+    "host": "0.0.0.0"                                      
   }
 }
