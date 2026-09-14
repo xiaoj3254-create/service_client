@@ -55,9 +55,8 @@ class AgentState(TypedDict):
     memory: Optional[BaseChatMessageHistory]
     # 由图 checkpointer 持久化，跨 LangGraph 工作进程仍可续聊（内存 session_manager 无法做到）
     persisted_dialogue: List[Any]
-    # 客户上传的图片（data URL，如 "data:image/jpeg;base64,..."）；无图时为 None
-    # 当前支持单图；如未来扩展多图，可改为 List[str]
-    customer_image: Optional[str]
+    # 客户上传的图片列表（data URL，如 "data:image/jpeg;base64,..."）；无图时为 None
+    customer_images: Optional[List[str]]
 
 # OpenAI兼容API客户端类
 class OpenAICompatibleClient:
@@ -261,9 +260,9 @@ def classify_query_node(state: AgentState) -> AgentState:
     if "messages" not in state:
         state["messages"] = []
 
-    # 客户图片（data URL）；由 run input 传入，无图时为 None
-    if "customer_image" not in state:
-        state["customer_image"] = None
+    # 客户图片列表（data URL）；由 run input 传入，无图时为 None
+    if "customer_images" not in state:
+        state["customer_images"] = None
 
     # 获取必需字段
     customer_query = state.get("customer_query", "")
@@ -310,8 +309,9 @@ def classify_query_node(state: AgentState) -> AgentState:
         "is_user": True,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    if state.get("customer_image"):
-        user_turn["image"] = state["customer_image"]
+    images = state.get("customer_images")
+    if images:
+        user_turn["images"] = images
     pd.append(user_turn)
     state["persisted_dialogue"] = pd
 

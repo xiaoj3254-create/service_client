@@ -36,21 +36,16 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key-here")
 app.config['SESSION_TYPE'] = 'filesystem'
 
-# 客户图片限制：base64 解码后最大 5MB
+# 客户图片限制：base64 解码后单张最大 5MB，最多 4 张
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_COUNT = 4
 
 
-def validate_image_data(image: Any) -> Tuple[Optional[str], Optional[str]]:
-    """
-    校验前端上传的图片 data URL。
-    合法返回 (data_url, None)；无图片返回 (None, None)；非法返回 (None, 错误信息)。
-    """
-    if image is None or image == '':
-        return None, None
+def _validate_single_image(image: str) -> Tuple[Optional[str], Optional[str]]:
+    """校验单张图片 data URL；合法返回 (data_url, None)，非法返回 (None, 错误信息)。"""
     if not isinstance(image, str) or not image.startswith('data:image/'):
         return None, '图片格式无效，仅支持 data URL 图片'
 
-    # 形如 data:image/png;base64,xxxx
     try:
         header, b64part = image.split(',', 1)
     except ValueError:
@@ -67,9 +62,40 @@ def validate_image_data(image: Any) -> Tuple[Optional[str], Optional[str]]:
     if len(raw) == 0:
         return None, '图片内容为空'
     if len(raw) > MAX_IMAGE_BYTES:
-        return None, f'图片过大，解码后不能超过 {MAX_IMAGE_BYTES // (1024 * 1024)}MB'
+        return None, f'图片过大，单张解码后不能超过 {MAX_IMAGE_BYTES // (1024 * 1024)}MB'
 
     return image, None
+
+
+def validate_image_data(image: Any) -> Tuple[Optional[List[str]], Optional[str]]:
+    """
+    校验前端上传的图片 data URL 或图片列表。
+    合法返回 (data_url_list, None)；无图片返回 (None, None)；非法返回 (None, 错误信息)。
+    """
+    if image is None or image == '':
+        return None, None
+
+    # 统一为列表处理
+    if isinstance(image, str):
+        images_raw = [image]
+    elif isinstance(image, list):
+        images_raw = image
+    else:
+        return None, '图片格式无效，仅支持 data URL 图片'
+
+    if len(images_raw) == 0:
+        return None, None
+    if len(images_raw) > MAX_IMAGE_COUNT:
+        return None, f'图片数量不能超过 {MAX_IMAGE_COUNT} 张'
+
+    validated = []
+    for img in images_raw:
+        ok, err = _validate_single_image(img)
+        if err:
+            return None, err
+        validated.append(ok)
+
+    return validated, None
 
 
 # --- Flask session 内的本地对话占位（主页模板可能使用）---
@@ -105,12 +131,12 @@ def chat():
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
 
-        image_data, img_err = validate_image_data(data.get('image'))
+        image_data, img_err = validate_image_data(data.get('images'))
         if img_err:
             return jsonify({'error': img_err}), 400
 
         ai_text, err_msg, http_code = run_chat_sync(
-            user_message, client_session_id, image=image_data
+            user_message, client_session_id, images=image_data
         )
         if err_msg:
             return jsonify({'error': err_msg}), http_code or 500
@@ -136,12 +162,12 @@ def chat_stream():
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
 
-        image_data, img_err = validate_image_data(data.get('image'))
+        image_data, img_err = validate_image_data(data.get('images'))
         if img_err:
             return jsonify({'error': img_err}), 400
 
         return Response(
-            stream_chat_events(user_message, client_session_id, image=image_data),
+            stream_chat_events(user_message, client_session_id, images=image_data),
             mimetype='text/event-stream'
         )
 

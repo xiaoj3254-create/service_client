@@ -1134,14 +1134,16 @@
             height: 18px;
         }
 
-        /* 待发送图片预览条（textarea 上方） */
+        /* 待发送图片预览条（textarea 上方，多图横排自动换行） */
         .image-preview-strip {
             display: none;
             padding: 6px 2px 0;
+            flex-wrap: wrap;
+            gap: 6px;
         }
 
         .image-preview-strip.visible {
-            display: block;
+            display: flex;
         }
 
         .image-preview-item {
@@ -1456,12 +1458,6 @@
                                     <div class="input-inner">
                                         <div class="input-composer" id="inputComposer">
                                             <div class="image-preview-strip" id="imagePreviewStrip">
-                                                <div class="image-preview-item">
-                                                    <img id="imagePreviewImg" src="" alt="待发送图片预览">
-                                                    <button type="button" class="image-preview-remove"
-                                                        id="imagePreviewRemove" title="移除图片"
-                                                        aria-label="移除图片">×</button>
-                                                </div>
                                             </div>
                                             <textarea id="messageInput" class="input-composer-field" rows="1"
                                                 placeholder="请输入您的问题..." maxlength="500" autocomplete="off"></textarea>
@@ -1534,8 +1530,8 @@
         let pendingDeleteSessionPayload = null;
         /** 侧栏会话列表缓存（供前端搜索过滤，无需重复请求） */
         let allSessions = [];
-        /** 待发送的客户图片（data URL）；null 表示无图片。当前支持单图 */
-        let pendingImage = null;
+        /** 待发送的客户图片列表（data URL 数组）；空数组表示无图片 */
+        let pendingImages = [];
 
         function pad2(n) {
             return String(n).padStart(2, '0');
@@ -1661,7 +1657,7 @@
             const trimmed = ta.value.trim();
             // currentSessionId 为 null 表示“尚未创建线程的新对话”，首条消息发送时后端会自动建线程
             // 有文本或有待发送图片即可发送
-            const canSend = (trimmed.length > 0 || !!pendingImage) && !isTyping;
+            const canSend = (trimmed.length > 0 || pendingImages.length > 0) && !isTyping;
             btn.classList.toggle('input-send-ready', canSend);
         }
 
@@ -1870,7 +1866,7 @@
         function createNewSession() {
             currentSessionId = null;
             clearChatContainer();
-            setPendingImage(null);
+            clearPendingImages();
             refreshSessionList();
             updateComposerSendReady();
             updateChatEmptyVisibility();
@@ -2100,17 +2096,17 @@
         function displaySessionHistory(sessionData) {
             if (sessionData.conversation_history) {
                 sessionData.conversation_history.forEach(function (msg) {
-                    var msgImage = msg.image || null;
+                    var msgImages = msg.images || null;
                     var msgContent = msg.content;
                     // 纯图片轮次：不显示"（图片消息）"占位文案，与发送时气泡保持一致
-                    if (msgImage && msgContent === '（图片消息）') {
+                    if (msgImages && msgContent === '（图片消息）') {
                         msgContent = '';
                     }
                     addMessage(
                         msg.is_user ? 'user' : 'assistant',
                         msgContent,
                         msg.timestamp,
-                        msgImage
+                        msgImages
                     );
                 });
             }
@@ -2123,19 +2119,19 @@
             let message = input.value.trim();
 
             // 纯图片消息：文本用占位文案，保证分类器与侧栏预览可用
-            if (!message && pendingImage) {
+            if (!message && pendingImages.length > 0) {
                 message = '（图片消息）';
             }
             // 正在发送中，或文本与图片都为空 → 中止
-            if (isTyping || (!message && !pendingImage)) return;
+            if (isTyping || (!message && pendingImages.length === 0)) return;
 
             // 快照本轮图片，并立即清空待发状态（防止发送中重复发送）
-            const imageToSend = pendingImage;
+            const imagesToSend = pendingImages.slice();
 
             // 添加用户消息到界面（含图片缩略图）
-            addMessage('user', message === '（图片消息）' && imageToSend ? '' : message, undefined, imageToSend);
+            addMessage('user', message === '（图片消息）' && imagesToSend.length > 0 ? '' : message, undefined, imagesToSend);
             input.value = '';
-            setPendingImage(null);
+            clearPendingImages();
             autoGrowMessageInput();
             updateComposerSendReady();
 
@@ -2149,8 +2145,8 @@
                     message: message,
                     session_id: currentSessionId
                 };
-                if (imageToSend) {
-                    requestBody.image = imageToSend;
+                if (imagesToSend.length > 0) {
+                    requestBody.images = imagesToSend;
                 }
 
                 const response = await fetch('/api/chat', {
@@ -2287,7 +2283,7 @@
         }
 
         // 添加消息到界面
-        function addMessage(role, content, tsOpt, imageUrl) {
+        function addMessage(role, content, tsOpt, imageUrls) {
             const chatContainer = document.getElementById('chatContainer');
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${role}`;
@@ -2295,24 +2291,31 @@
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
 
-            // 图片缩略图（点击新窗口查看大图）
-            if (imageUrl) {
-                const imgEl = document.createElement('img');
+            // 图片缩略图列表（点击新窗口查看大图）；兼容旧的单图字符串
+            var imgList = [];
+            if (typeof imageUrls === 'string' && imageUrls) {
+                imgList = [imageUrls];
+            } else if (Array.isArray(imageUrls)) {
+                imgList = imageUrls;
+            }
+            imgList.forEach(function (url) {
+                if (!url) return;
+                var imgEl = document.createElement('img');
                 imgEl.className = 'message-image';
-                imgEl.src = imageUrl;
+                imgEl.src = url;
                 imgEl.alt = '客户上传的图片';
                 imgEl.addEventListener('click', function () {
-                    const w = window.open();
+                    var w = window.open();
                     if (w) {
                         w.document.write(
                             '<title>图片预览</title><body style="margin:0;background:#111;display:flex;align-items:center;justify-content:center;">'
-                            + '<img src="' + imageUrl + '" style="max-width:100%;max-height:100vh;">'
+                            + '<img src="' + url + '" style="max-width:100%;max-height:100vh;">'
                             + '</body>'
                         );
                     }
                 });
                 contentDiv.appendChild(imgEl);
-            }
+            });
 
             if (content !== undefined && content !== null && String(content) !== '') {
                 attachMessageBody(contentDiv, content, role === 'assistant');
@@ -2383,21 +2386,60 @@
         const IMAGE_MAX_EDGE = 1280;
         const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
-        /** 设置待发送图片并刷新预览条 */
-        function setPendingImage(dataUrl) {
-            pendingImage = dataUrl;
+        /** 最大图片数量 */
+        const MAX_PENDING_IMAGES = 4;
+
+        /** 刷新预览条 DOM（根据 pendingImages 数组重新渲染缩略图列表） */
+        function renderImagePreviews() {
             const strip = document.getElementById('imagePreviewStrip');
-            const img = document.getElementById('imagePreviewImg');
             const btn = document.getElementById('imageUploadBtn');
-            if (dataUrl) {
-                if (img) img.src = dataUrl;
-                if (strip) strip.classList.add('visible');
-                if (btn) btn.classList.add('has-image');
-            } else {
-                if (img) img.src = '';
-                if (strip) strip.classList.remove('visible');
+            if (!strip) return;
+            strip.innerHTML = '';
+            if (pendingImages.length === 0) {
+                strip.classList.remove('visible');
                 if (btn) btn.classList.remove('has-image');
+            } else {
+                strip.classList.add('visible');
+                if (btn) btn.classList.add('has-image');
+                pendingImages.forEach(function (dataUrl, idx) {
+                    var item = document.createElement('div');
+                    item.className = 'image-preview-item';
+                    var imgEl = document.createElement('img');
+                    imgEl.src = dataUrl;
+                    imgEl.alt = '待发送图片预览';
+                    var rmBtn = document.createElement('button');
+                    rmBtn.type = 'button';
+                    rmBtn.className = 'image-preview-remove';
+                    rmBtn.title = '移除图片';
+                    rmBtn.setAttribute('aria-label', '移除图片');
+                    rmBtn.textContent = '×';
+                    rmBtn.addEventListener('click', function () {
+                        pendingImages.splice(idx, 1);
+                        renderImagePreviews();
+                        updateComposerSendReady();
+                    });
+                    item.appendChild(imgEl);
+                    item.appendChild(rmBtn);
+                    strip.appendChild(item);
+                });
             }
+        }
+
+        /** 添加一张待发送图片（压缩后 data URL） */
+        function addPendingImage(dataUrl) {
+            if (pendingImages.length >= MAX_PENDING_IMAGES) {
+                addSystemMessage('最多只能上传 ' + MAX_PENDING_IMAGES + ' 张图片');
+                return;
+            }
+            pendingImages.push(dataUrl);
+            renderImagePreviews();
+            updateComposerSendReady();
+        }
+
+        /** 清空所有待发送图片 */
+        function clearPendingImages() {
+            pendingImages = [];
+            renderImagePreviews();
             updateComposerSendReady();
         }
 
@@ -2465,7 +2507,7 @@
             }
             try {
                 const dataUrl = await compressImageFile(file);
-                setPendingImage(dataUrl);
+                addPendingImage(dataUrl);
             } catch (e) {
                 addSystemMessage('图片处理失败：' + e.message);
             }
@@ -2474,7 +2516,6 @@
         (function setupImageUpload() {
             const fileInput = document.getElementById('imageFileInput');
             const uploadBtn = document.getElementById('imageUploadBtn');
-            const removeBtn = document.getElementById('imagePreviewRemove');
 
             if (uploadBtn && fileInput) {
                 uploadBtn.addEventListener('click', function () {
@@ -2485,11 +2526,6 @@
                     if (fileInput.files && fileInput.files[0]) {
                         handleImageFileSelected(fileInput.files[0]);
                     }
-                });
-            }
-            if (removeBtn) {
-                removeBtn.addEventListener('click', function () {
-                    setPendingImage(null);
                 });
             }
         })();

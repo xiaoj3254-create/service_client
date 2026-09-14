@@ -55,10 +55,10 @@ def append_turn_from_state(conversation_history: List[Dict[str, Any]], msg: Dict
     ts = msg.get("timestamp")
     if ts is not None and ts != "":
         entry["timestamp"] = ts
-    # 客户上传的图片（data URL）随轮次透传，供前端历史回显
-    image = msg.get("image")
-    if image:
-        entry["image"] = image
+    # 客户上传的图片列表（data URL）随轮次透传，供前端历史回显
+    images = msg.get("images")
+    if images:
+        entry["images"] = images
     conversation_history.append(entry)
 
 
@@ -428,12 +428,12 @@ def clear_thread_and_create_new(thread_id: str) -> Tuple[Optional[str], Optional
 def run_chat_sync(
     user_message: str,
     client_session_id: Optional[str] = None,
-    image: Optional[str] = None,
+    images: Optional[List[str]] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """
     在当前线程上提交一轮用户消息并等待完成。
     client_session_id: 前端传入的会话 ID（可为 LangGraph 线程 ID）。
-    image: 可选的客户图片 data URL（"data:image/...;base64,..."），随输入传给工作流。
+    images: 可选的客户图片 data URL 列表（"data:image/...;base64,..."），随输入传给工作流。
     返回 (ai_text, error_text, http_status_optional)。
     """
     global _assistant_id, _current_thread_id
@@ -449,7 +449,7 @@ def run_chat_sync(
 
     assert _assistant_id and _current_thread_id
 
-    # 工作流输入（含可选客户图片）
+    # 工作流输入（含可选客户图片列表）
     run_input: Dict[str, Any] = {
         "messages": [
             {
@@ -460,8 +460,8 @@ def run_chat_sync(
         "customer_query": user_message.strip(),
         "session_id": _current_thread_id
     }
-    if image:
-        run_input["customer_image"] = image
+    if images:
+        run_input["customer_images"] = images
 
     try:
         run_resp = requests.post(
@@ -530,11 +530,11 @@ def run_chat_sync(
 def stream_chat_events(
     user_message: str,
     client_session_id: Optional[str] = None,
-    image: Optional[str] = None,
+    images: Optional[List[str]] = None,
 ) -> Iterable[str]:
     """
     生成 SSE data 行（含末尾 [DONE]），供 Flask Response 逐块写出。
-    image: 可选的客户图片 data URL。
+    images: 可选的客户图片 data URL 列表。
     """
     global _assistant_id, _current_thread_id
 
@@ -555,14 +555,14 @@ def stream_chat_events(
 
     assert _assistant_id is not None and _current_thread_id is not None
 
-    # 工作流输入（含可选客户图片）
+    # 工作流输入（含可选客户图片列表）
     stream_run_input: Dict[str, Any] = {
         "messages": [{"role": "user", "content": user_message.strip()}],
         "customer_query": user_message.strip(),
         "session_id": _current_thread_id
     }
-    if image:
-        stream_run_input["customer_image"] = image
+    if images:
+        stream_run_input["customer_images"] = images
 
     try:
         response = requests.post(

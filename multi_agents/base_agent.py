@@ -27,15 +27,15 @@ class BaseAgent(ABC):
 
     def _build_human_message(self, text: str, state: Optional[Dict[str, Any]] = None) -> HumanMessage:
         """
-        构造用户消息：若 state 中含客户上传的图片（customer_image，data URL），
-        则构造 OpenAI 兼容的多模态消息（text + image_url），否则为纯文本消息。
+        构造用户消息：若 state 中含客户上传的图片列表（customer_images，data URL），
+        则构造 OpenAI 兼容的多模态消息（text + 多个 image_url），否则为纯文本消息。
         """
-        image = (state or {}).get("customer_image")
-        if image:
-            return HumanMessage(content=[
-                {"type": "text", "text": str(text)},
-                {"type": "image_url", "image_url": {"url": image}},
-            ])
+        images = (state or {}).get("customer_images")
+        if images:
+            content_parts = [{"type": "text", "text": str(text)}]
+            for img in images:
+                content_parts.append({"type": "image_url", "image_url": {"url": img}})
+            return HumanMessage(content=content_parts)
         return HumanMessage(content=text)
 
     @abstractmethod
