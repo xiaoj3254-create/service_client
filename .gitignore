@@ -393,3 +393,8 @@ tmp/
 *.backup
 
 .langgraph_api
+
+# WorkBuddy workspace data（项目相关数据，非缓存，禁止删除）
+.workbuddy/
+
+项目审查报告.md

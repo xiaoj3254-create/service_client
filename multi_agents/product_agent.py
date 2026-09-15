@@ -122,6 +122,7 @@ class ProductAgent(BaseAgent):
         """匹配查询中的产品信息"""
         query_lower = query.lower()
         matched_info = []
+        matched_categories = set()
 
         # 精确匹配产品名称
         for product_name, product_info in self.product_database.items():
@@ -135,17 +136,20 @@ class ProductAgent(BaseAgent):
 适用人群：{product_info['适用人群']}
 推荐指数：{product_info['推荐指数']}"""
                 matched_info.append(info_text)
+                matched_categories.add(product_name)
 
-        # 如果没有精确匹配，尝试模糊匹配
-        if not matched_info:
+        # 如果没有精确匹配，尝试模糊匹配（泛问"产品"时给出概览）
+        if not matched_info and any(
+            keyword in query_lower for keyword in ["手机", "电脑", "耳机", "平板", "产品", "推荐"]
+        ):
             for product_name, product_info in self.product_database.items():
-                # 检查查询中是否包含产品相关的关键词
-                if any(keyword in query_lower for keyword in ["手机", "电脑", "耳机", "平板", "产品"]):
-                    if product_name not in [info.split('：')[1] for info in matched_info]:
-                        info_text = f"""相关产品：{product_name}
+                if product_name in matched_categories:
+                    continue
+                info_text = f"""相关产品：{product_name}
 品牌：{product_info['品牌']}
 价格区间：{product_info['价格区间']}
 主要特点：{', '.join(product_info['主要特点'][:2])}..."""
-                        matched_info.append(info_text)
+                matched_info.append(info_text)
+                matched_categories.add(product_name)
 
         return "\n\n".join(matched_info) if matched_info else ""

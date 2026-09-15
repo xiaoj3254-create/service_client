@@ -18,10 +18,46 @@ _CLASS_LABELS: Tuple[str, ...] = (
 )
 
 
+# 未识别标签时的保守兜底。
+# 注意：必须是 out_of_scope 而非 general_inquiry —— 识别失败时模型很可能正处于
+# 「拒答」状态（输出的是自然语言如「很抱歉，我无法完成该请求」），此时若降级为
+# general_inquiry 会把一次正确的拒绝改判成正常业务咨询，护栏在最该生效的场景失效。
+_FALLBACK_LABEL = "out_of_scope"
+
+# 拒答/越界语义的中文表述（子串命中即视为 out_of_scope），
+# 用于补救分类模型未按规定输出标签、而以自然语言表达的拒绝。
+_REFUSAL_MARKERS: Tuple[str, ...] = (
+    "无法回答", "无法完成", "无法满足", "无法协助", "无法提供",
+    "不能回答", "不能完成", "不能提供", "不能协助",
+    "无法处理该", "超出", "不在服务范围", "不属于客服",
+    "抱歉，我", "对不起，我", "作为ai", "作为人工智能",
+    "拒绝回答", "无权",
+)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    """判断规范化失败的输出是否属于拒答表述（含中英文）。"""
+    if not text:
+        return False
+    if any(marker in text for marker in _REFUSAL_MARKERS):
+        return True
+    # 英文拒答（小写化后匹配）
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in ("cannot", "can't", "can not", "unable to", "i'm sorry", "i am sorry", "not able to")
+    )
+
+
 def normalize_classifier_label(raw: str) -> str:
-    """将分类 LLM 输出规范为允许的标签之一（抗多行、前缀说明、大小写）。"""
+    """
+    将分类 LLM 输出规范为允许的标签之一（抗多行、前缀说明、大小写）。
+
+    兜底策略（重要）：无法识别时返回 out_of_scope，保证「识别不了就不放行」，
+    避免误把拒答/越界请求当成正常业务咨询路由给业务智能体。
+    """
     if not raw:
-        return "general_inquiry"
+        return _FALLBACK_LABEL
 
     text = raw.strip().lower().replace("-", "_")
     first = text.split("\n")[0].strip().split()[0].strip(".,;:\"'") if text else ""
@@ -30,12 +66,25 @@ def normalize_classifier_label(raw: str) -> str:
         if label == first or label == text:
             return label
 
-    # 子串匹配（按标签长度降序，减少误吸短词）
-    for label in sorted(_CLASS_LABELS, key=len, reverse=True):
-        if label in text:
+    # 空格分隔的变体（如 "general inquiry"）先还原为下划线再匹配，
+    # 避免把合法的业务标签因分隔符差异误判为越界。
+    text_spaced = text.replace(" ", "_")
+    for label in _CLASS_LABELS:
+        if label == text_spaced:
             return label
 
-    return "general_inquiry"
+    # 子串匹配（按标签长度降序，减少误吸短词）
+    for label in sorted(_CLASS_LABELS, key=len, reverse=True):
+        if label in text or label in text_spaced:
+            return label
+
+    # 规范化失败：统一保守兜底为 out_of_scope（不放行）
+    # _looks_like_refusal 仅用于日志可观测性，不改变兜底结果。
+    if _looks_like_refusal(raw):
+        print(f"⚠️ 分类输出未命中标签且疑似拒答表述，按 out_of_scope 处理: {raw[:80]!r}")
+    else:
+        print(f"⚠️ 分类输出无法识别，按 out_of_scope 保守兜底: {raw[:80]!r}")
+    return _FALLBACK_LABEL
 
 
 @tool
@@ -67,4 +116,5 @@ def classify_query(query: str, llm=None) -> str:
         return normalize_classifier_label(result)
     except Exception as e:
         print(f"Error in classify_query: {e}")
-        return "general_inquiry"
+        # 分类失败时同样保守兜底：宁可拒答，也不把未知请求路由给业务智能体
+        return _FALLBACK_LABEL

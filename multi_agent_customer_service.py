@@ -270,10 +270,15 @@ def classify_query_node(state: AgentState) -> AgentState:
 
     if not customer_query:
         state["response"] = "Error: No customer query provided"
-        state["query_type"] = "general_inquiry"
+        state["query_type"] = "out_of_scope"
+        # 必须显式设置 next_agent：否则条件边会取默认值 general_agent，绕过护栏
+        state["next_agent"] = "final_response"
         return state
 
     # 使用分类工具
+    # 兜底一律取 out_of_scope（保守拒答），绝不默认路由到业务智能体：
+    # 分类链路异常时无法判断是否越界，放行存在护栏绕过风险。
+    query_type = "out_of_scope"
     try:
         llm_instance = get_llm()
         # 使用正确的工具调用方式
@@ -282,11 +287,11 @@ def classify_query_node(state: AgentState) -> AgentState:
             query_type = result
         except Exception as e:
             print(f"Error in tool invocation: {e}")
-            # 回退到基础分类逻辑
-            query_type = "general_inquiry"
+            # 回退到保守兜底
+            query_type = "out_of_scope"
     except Exception as e:
         print(f"Error in query classification: {e}")
-        query_type = "general_inquiry"
+        query_type = "out_of_scope"
 
     # 更新状态
     state["query_type"] = query_type
@@ -395,14 +400,40 @@ def final_response_node(state: AgentState) -> AgentState:
     state["next_agent"] = ""
     return state
 
+# 默认 checkpointer：进程内持久化，无外部依赖。
+# 显式挂载它，使 persisted_dialogue 的持久化语义在「独立运行」与「平台托管」两种
+# 模式下都成立（此前 compile() 未传 checkpointer，独立运行时多轮对话无记忆）。
+_default_checkpointer = None
+
+
+def get_default_checkpointer():
+    """惰性创建并复用进程级默认 checkpointer。"""
+    global _default_checkpointer
+    if _default_checkpointer is None:
+        from langgraph.checkpoint.memory import InMemorySaver
+        _default_checkpointer = InMemorySaver()
+        print("✅ 已启用默认 InMemorySaver checkpointer（进程内持久化）")
+    return _default_checkpointer
+
+
 # 图表入口点
 # 使用方式：在langgraph.json文件中增加以下配置，声明构建图的方式，硬编码方式实现。
 # "graphs": {
 #     "customer_service": "./multi_agent_customer_service.py:make_graph"
 # },
 # 也可以在langgraph.json文件中使用workflow配置化的方式定义图的结构，但功能相对简单，无法实现复杂的逻辑
-def make_graph():
-    """构建LangGraph工作流图"""
+def make_graph(checkpointer=None):
+    """
+    构建LangGraph工作流图。
+
+    Args:
+        checkpointer: 可选的 checkpointer 实例。
+            - 由 LangGraph Platform / CLI 托管时，平台会自动注入服务端 checkpointer，
+              此时无需传入，图会交由平台管理持久化。
+            - 独立运行（如 `python multi_agent_customer_service.py`、自写脚本）时
+              传 None，将自动使用进程内 InMemorySaver，保证多轮对话记忆可用。
+            - 需要跨进程/持久化到磁盘时，可传入 SqliteSaver / PostgresSaver 等实例。
+    """
     # 创建工作流图
     workflow = StateGraph(AgentState)
 
@@ -442,10 +473,12 @@ def make_graph():
     # 设置结束点
     workflow.set_finish_point("final_response")
 
-    # 编译工作流
-    app = workflow.compile()
+    # 编译工作流：显式挂载 checkpointer，保证 persisted_dialogue 真正被持久化
+    if checkpointer is None:
+        checkpointer = get_default_checkpointer()
+    app = workflow.compile(checkpointer=checkpointer)
 
-    print("✅ LangGraph工作流图构建完成")
+    print("✅ LangGraph工作流图构建完成（已挂载 checkpointer）")
     return app
 
 # 创建默认工作流实例

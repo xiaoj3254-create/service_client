@@ -102,29 +102,59 @@ class ComplaintAgent(BaseAgent):
         return state
 
     def _match_complaint_info(self, query: str) -> str:
-        """匹配查询中的投诉信息"""
+        """匹配查询中的投诉信息。
+
+        匹配策略（按优先级）：
+        1. 类别名精确命中：query 含 "服务问题"/"产品质量"/"物流配送" 时，返回该类别全部条目。
+        2. 具体条目名命中：query 含 "配送延迟"/"功能缺陷" 等条目名时，返回所属类别中命中的条目。
+        3. 模糊兜底：出现投诉类关键词时，**只返回最相关的一个类别**的前 2 条，
+           避免把整个知识库塞进 prompt。
+        """
         query_lower = query.lower()
         matched_info = []
+        matched_categories = set()
 
-        # 精确匹配投诉类型
+        # 1. 类别名精确命中
         for category, solutions in self.complaint_database.items():
             if any(keyword in query_lower for keyword in category.lower().split()):
-                # 格式化投诉信息
-                info_text = f"""【{category}】\n"""
+                info_text = f"【{category}】\n"
                 for issue, solution in solutions.items():
                     info_text += f"• {issue}：{solution}\n"
                 matched_info.append(info_text)
+                matched_categories.add(category)
 
-        # 如果没有精确匹配，尝试关键词匹配
+        # 2. 具体条目名命中（补足类别名未命中的场景，如只说了"配送延迟"）
         if not matched_info:
             for category, solutions in self.complaint_database.items():
-                if any(keyword in query_lower for keyword in ["投诉", "问题", "建议", "不满", "改进"]):
-                    info_text = f"""相关处理：{category}\n"""
-                    # 只显示前2项解决方案
-                    for i, (issue, solution) in enumerate(solutions.items()):
-                        if i < 2:
-                            info_text += f"• {issue}：{solution}\n"
-                    info_text += "..."
+                hit_items = [
+                    (issue, solution)
+                    for issue, solution in solutions.items()
+                    if issue in query_lower
+                ]
+                if hit_items:
+                    info_text = f"【{category}】\n"
+                    for issue, solution in hit_items:
+                        info_text += f"• {issue}：{solution}\n"
                     matched_info.append(info_text)
+                    matched_categories.add(category)
+
+        # 3. 模糊兜底：关键词判断在循环外，且只取一个类别
+        if not matched_info and any(
+            keyword in query_lower
+            for keyword in ["投诉", "问题", "建议", "不满", "改进", "反馈"]
+        ):
+            for category, solutions in self.complaint_database.items():
+                if category in matched_categories:
+                    continue
+                info_text = f"相关处理：{category}\n"
+                # 只显示前2项解决方案
+                for i, (issue, solution) in enumerate(solutions.items()):
+                    if i < 2:
+                        info_text += f"• {issue}：{solution}\n"
+                info_text += "..."
+                matched_info.append(info_text)
+                matched_categories.add(category)
+                # 兜底只取第一个命中的类别即停止，避免全量注入
+                break
 
         return "\n".join(matched_info) if matched_info else ""

@@ -13,8 +13,32 @@
     "nodes": {                                              
       "classify_query": {
         "type": "function",
-        "description": "分类客户查询类型",
+        "description": "分类客户查询类型（含 out_of_scope 护栏，越界直接返回固定拒答）",
         "function": "classify_query_node"
+      },
+      "product_agent": {
+        "type": "agent",
+        "description": "产品专家智能体",
+        "agent": "ProductAgent",
+        "expertise": ["产品规格", "价格比较", "功能特点", "市场分析"]
+      },
+      "tech_agent": {
+        "type": "agent",
+        "description": "技术支持智能体",
+        "agent": "TechAgent",
+        "expertise": ["故障诊断", "系统优化", "软件配置", "硬件维修"]
+      },
+      "billing_agent": {
+        "type": "agent",
+        "description": "账单专家智能体",
+        "agent": "BillingAgent",
+        "expertise": ["退款处理", "发票管理", "价格计算", "支付问题"]
+      },
+      "complaint_agent": {
+        "type": "agent",
+        "description": "投诉处理智能体",
+        "agent": "ComplaintAgent",
+        "expertise": ["问题记录", "解决方案", "补偿措施", "服务改进"]
       },
       "general_agent": {
         "type": "agent",
@@ -35,7 +59,8 @@
           "technical_support": "tech_agent",
           "billing": "billing_agent",
           "complaint": "complaint_agent",
-          "general_inquiry": "general_agent"
+          "general_inquiry": "general_agent",
+          "out_of_scope": "final_response"
         }
       },
       "direct": [                                            

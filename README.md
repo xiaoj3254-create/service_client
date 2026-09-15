@@ -69,6 +69,20 @@ customer-service-ai-agent/
 - **多轮对话**：同一会话内支持连续对话，自动续写上下文
 - **护栏机制**：非客服范围查询（越狱、闲聊等）直接拦截，不进入业务智能体
 
+> **关于 checkpointer**：`make_graph()` 默认挂载 `InMemorySaver`（进程内持久化），
+> 因此 `python multi_agent_customer_service.py` 等独立运行方式同样具备多轮对话记忆。
+> 在 LangGraph Platform / CLI 托管模式下，平台会注入服务端 checkpointer 接管持久化。
+> 需要跨进程或落盘时，可显式传入自定义 checkpointer：
+>
+> ```python
+> from langgraph.checkpoint.memory import InMemorySaver
+> app = make_graph(checkpointer=InMemorySaver())
+> ```
+
+> **关于护栏兜底**：分类输出无法识别时的兜底标签为 `out_of_scope`（保守拒答），
+> 而非 `general_inquiry`。这样可确保「识别不了就不放行」，避免分类链路异常时
+> 把越界或拒答请求误路由到业务智能体。
+
 ## 安装和配置
 
 ### 1. 创建虚拟环境并安装依赖
