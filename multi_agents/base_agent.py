@@ -3,10 +3,13 @@
 所有专门智能体的基类
 """
 
+import logging
 from typing import Dict, List, Any, Optional
 from abc import ABC, abstractmethod
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from session_manager import LangChainSessionManager
+
+logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
@@ -38,10 +41,86 @@ class BaseAgent(ABC):
             return HumanMessage(content=content_parts)
         return HumanMessage(content=text)
 
+    # ------------------------------------------------------------------
+    # 子类必须实现的抽象方法
+    # ------------------------------------------------------------------
+
     @abstractmethod
+    def _get_system_prompt(self) -> str:
+        """返回该智能体的基础系统提示词（不含对话上下文增强）。"""
+
+    @abstractmethod
+    def _match_data(self, query: str) -> str:
+        """根据用户查询匹配领域知识库，返回格式化的上下文文本；无匹配时返回空串。"""
+
+    # ------------------------------------------------------------------
+    # 可选覆盖的方法
+    # ------------------------------------------------------------------
+
+    def _get_error_fallback(self) -> str:
+        """LLM 调用失败时的兜底回复，子类可覆盖以提供更贴切的文案。"""
+        return "抱歉，处理您的请求时遇到系统错误，请稍后重试。"
+
+    # ------------------------------------------------------------------
+    # 公共流程模板（所有领域 agent 共用）
+    # ------------------------------------------------------------------
+
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """处理客户查询的抽象方法"""
-        pass
+        """
+        处理客户查询的模板方法。
+        公共流程：取查询 -> 取对话上下文 -> 匹配领域数据 -> 构建消息 -> 调 LLM -> 写 state。
+        子类只需实现 _get_system_prompt / _match_data，可覆盖 _get_error_fallback。
+        """
+        customer_query = state["customer_query"]
+        session_id = state.get("session_id", "default")
+
+        # 对话轮次由 classify / 外层节点写入 persisted_dialogue，此处只读 state
+        conversation_context = self._get_conversation_context(session_id, state)
+
+        # 从领域知识库匹配相关信息
+        matched_info = self._match_data(customer_query)
+
+        # 构建系统提示并增强对话上下文说明
+        base_system_prompt = self._get_system_prompt()
+        system_prompt = self._enhance_system_prompt_with_context(base_system_prompt)
+
+        # 构建消息列表
+        messages = []
+
+        # 添加对话历史上下文（如果有的话）
+        if conversation_context:
+            context_message = f"""对话历史上下文：
+{conversation_context}
+
+请基于以上对话历史和当前查询，提供连贯的回答。"""
+            messages.append(SystemMessage(content=context_message))
+
+        # 添加系统提示
+        messages.append(SystemMessage(content=system_prompt))
+
+        # 如果有匹配的领域信息，添加到上下文中（含客户上传图片时构造多模态消息）
+        if matched_info:
+            data_context = f"""领域信息：
+{matched_info}
+
+当前查询：{customer_query}"""
+            messages.append(self._build_human_message(data_context, state))
+        else:
+            messages.append(self._build_human_message(customer_query, state))
+
+        # 调用LLM
+        try:
+            response = self.llm.invoke(messages)
+            response_content = response.content
+        except Exception as e:
+            logger.warning("%s 调用LLM时出错: %s", self.name, e)
+            response_content = self._get_error_fallback()
+
+        state["response"] = response_content
+        state["current_agent"] = self.name
+        state["tools_used"].append(f"{self.name}_processing")
+
+        return state
 
     def _get_conversation_context(
         self,
@@ -77,7 +156,7 @@ class BaseAgent(ABC):
 
             return "\n".join(context_lines)
         except Exception as e:
-            print(f"获取对话上下文时出错: {e}")
+            logger.warning("获取对话上下文时出错: %s", e)
             return ""
 
     def _add_message_to_session(self, session_id: str, message: str, is_user: bool = True):
@@ -85,7 +164,7 @@ class BaseAgent(ABC):
         try:
             self.session_manager.add_message(session_id, message, is_user)
         except Exception as e:
-            print(f"添加消息到会话时出错: {e}")
+            logger.warning("添加消息到会话时出错: %s", e)
 
     def _enhance_system_prompt_with_context(self, base_prompt: str) -> str:
         """增强系统提示，添加对话上下文说明"""

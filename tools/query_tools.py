@@ -2,10 +2,13 @@
 查询分类工具函数
 """
 
+import logging
 from typing import Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 
 # 与 multi_agent_customer_service 中 conditional_edges 的 key 保持一致
 _CLASS_LABELS: Tuple[str, ...] = (
@@ -81,9 +84,9 @@ def normalize_classifier_label(raw: str) -> str:
     # 规范化失败：统一保守兜底为 out_of_scope（不放行）
     # _looks_like_refusal 仅用于日志可观测性，不改变兜底结果。
     if _looks_like_refusal(raw):
-        print(f"⚠️ 分类输出未命中标签且疑似拒答表述，按 out_of_scope 处理: {raw[:80]!r}")
+        logger.warning("分类输出未命中标签且疑似拒答表述，按 out_of_scope 处理: %r", raw[:80])
     else:
-        print(f"⚠️ 分类输出无法识别，按 out_of_scope 保守兜底: {raw[:80]!r}")
+        logger.warning("分类输出无法识别，按 out_of_scope 保守兜底: %r", raw[:80])
     return _FALLBACK_LABEL
 
 
@@ -113,8 +116,10 @@ def classify_query(query: str, llm=None) -> str:
     try:
         response = llm.invoke(messages)
         result = (getattr(response, "content", "") or "").strip()
-        return normalize_classifier_label(result)
+        normalized = normalize_classifier_label(result)
+        logger.info("classify_query 输入=%r 原始输出=%r 规范化=%s", query[:60], result[:120], normalized)
+        return normalized
     except Exception as e:
-        print(f"Error in classify_query: {e}")
+        logger.warning("classify_query 出错，保守兜底: %s", e)
         # 分类失败时同样保守兜底：宁可拒答，也不把未知请求路由给业务智能体
         return _FALLBACK_LABEL

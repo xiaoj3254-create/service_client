@@ -7,6 +7,8 @@
 import os
 import base64
 import binascii
+import logging
+import secrets
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -24,16 +26,25 @@ from chat_web_service import (
     delete_remote_thread,
     clear_thread_and_create_new,
     langgraph_connectivity_test,
-    get_current_thread_id,
 )
 
 # 导入配置（与历史行为保持一致）
 from config import *  # noqa: E402,F401,F403
 
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
 # Flask 配置
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key-here")
+# 生产环境必须设置强 FLASK_SECRET_KEY 环境变量；
+# 未设置或使用已知弱默认值时，生成随机密钥（仅开发可用，重启后 session 失效）。
+_WEAK_SECRET_DEFAULTS = {"", "your-secret-key-here", "change-me", "secret"}
+_flask_secret = os.getenv("FLASK_SECRET_KEY", "")
+if _flask_secret in _WEAK_SECRET_DEFAULTS:
+    logger.warning("FLASK_SECRET_KEY 未设置或为弱默认值，已生成随机密钥（仅开发环境可用，重启后 session 失效）")
+    _flask_secret = secrets.token_hex(32)
+app.secret_key = _flask_secret
 app.config['SESSION_TYPE'] = 'filesystem'
 
 # 客户图片限制：base64 解码后单张最大 5MB，最多 4 张
@@ -135,23 +146,20 @@ def chat():
         if img_err:
             return jsonify({'error': img_err}), 400
 
-        ai_text, err_msg, http_code = run_chat_sync(
+        ai_text, err_msg, http_code, thread_id = run_chat_sync(
             user_message, client_session_id, images=image_data
         )
         if err_msg:
             return jsonify({'error': err_msg}), http_code or 500
 
-        tid = get_current_thread_id()
         return jsonify({
             'response': ai_text,
-            'session_id': tid,
-            'thread_id': tid,
+            'session_id': thread_id,
+            'thread_id': thread_id,
         })
     except Exception as e:
-        print(f"❌ 聊天处理错误: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': f'内部错误: {str(e)}'}), 500
+        logger.exception("聊天处理错误")
+        return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
 
 
 @app.route('/api/chat/stream', methods=['POST'])
@@ -172,8 +180,8 @@ def chat_stream():
         )
 
     except Exception as e:
-        print(f"❌ 流式聊天处理错误: {e}")
-        return jsonify({'error': f'内部错误: {str(e)}'}), 500
+        logger.exception("流式聊天处理错误")
+        return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
 
 
 @app.route('/api/sessions', methods=['GET'])
@@ -205,7 +213,8 @@ def delete_session(session_id):
             return jsonify({'message': '会话删除成功'})
         return jsonify({'error': f'删除会话失败: {status}'}), 500
     except Exception as e:
-        return jsonify({'error': f'服务器错误: {str(e)}'}), 500
+        logger.exception("删除会话时出错")
+        return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
 
 
 @app.route('/api/sessions/<session_id>/clear', methods=['POST'])
@@ -224,7 +233,8 @@ def clear_session(session_id):
             'new_thread_id': new_thread_id
         })
     except Exception as e:
-        return jsonify({'error': f'服务器错误: {str(e)}'}), 500
+        logger.exception("清空会话时出错")
+        return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
 
 
 @app.route('/api/new_session', methods=['POST'])
@@ -242,7 +252,8 @@ def create_new_session():
             'message': '新会话创建成功'
         })
     except Exception as e:
-        return jsonify({'error': f'创建会话失败: {str(e)}'}), 500
+        logger.exception("创建会话时出错")
+        return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
 
 
 @app.route('/api/health')
@@ -265,13 +276,13 @@ def test_langgraph():
 
 def main():
     """主函数"""
-    print("🚀 多智能体客服系统 Web 应用")
-    print("=" * 60)
-    print("🌐 启动 Web 服务...")
-    print("📱 访问地址: http://localhost:5000")
-    print("💡 按 Ctrl+C 停止服务")
-    print()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    logger.info("🚀 多智能体客服系统 Web 应用")
+    logger.info("=" * 60)
+    logger.info("🌐 启动 Web 服务...")
+    logger.info("📱 访问地址: http://localhost:5000")
+    logger.info("💡 按 Ctrl+C 停止服务")
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host='0.0.0.0', port=5000, debug=debug_mode)
 
 
 if __name__ == "__main__":

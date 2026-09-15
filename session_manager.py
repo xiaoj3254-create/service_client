@@ -7,11 +7,14 @@
 import os
 import time
 import uuid
+import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 
 from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+
+logger = logging.getLogger(__name__)
 
 # 存储后端导入
 from langchain_community.chat_message_histories import (
@@ -51,7 +54,7 @@ class LangChainSessionManager:
         # 验证存储后端配置
         self._validate_storage_config()
 
-        print(f"📱 会话管理器初始化完成，使用 {storage_backend} 后端")
+        logger.info("会话管理器初始化完成，使用 %s 后端", storage_backend)
 
     def _validate_storage_config(self):
         """验证存储后端配置"""
@@ -137,7 +140,7 @@ class LangChainSessionManager:
             "storage_backend": self.storage_backend
         }
 
-        print(f"📱 Created new session: {session_id} (using {self.storage_backend} backend)")
+        logger.info("Created new session: %s (using %s backend)", session_id, self.storage_backend)
 
         return session_id
 
@@ -191,7 +194,7 @@ class LangChainSessionManager:
         session = self.get_session(session_id)
 
         if not isinstance(session, dict):
-            print(f"❌ Error: session is not a dict for session_id {session_id}, type: {type(session)}")
+            logger.error("session is not a dict for session_id %s, type: %s", session_id, type(session))
             return
 
         memory = session["memory"]
@@ -205,7 +208,7 @@ class LangChainSessionManager:
         session["message_count"] += 1
         session["last_activity"] = time.time()
 
-        print(f"📝 Session {session_id} added {'user' if is_user else 'AI'} message")
+        logger.debug("Session %s added %s message", session_id, 'user' if is_user else 'AI')
 
     def get_conversation_history(self, session_id: str) -> List[BaseMessage]:
         """
@@ -302,7 +305,7 @@ class LangChainSessionManager:
             self.sessions[session_id]["message_count"] = 0
             self.sessions[session_id]["last_activity"] = time.time()
 
-            print(f"🧹 Cleared session: {session_id}")
+            logger.info("Cleared session: %s", session_id)
 
     def delete_session(self, session_id: str):
         """
@@ -319,7 +322,7 @@ class LangChainSessionManager:
             # 删除会话记录
             del self.sessions[session_id]
 
-            print(f"🗑️ Deleted session: {session_id}")
+            logger.info("Deleted session: %s", session_id)
 
     def cleanup_old_sessions(self, max_age_hours: int = 24) -> int:
         """
@@ -343,7 +346,7 @@ class LangChainSessionManager:
             self.delete_session(session_id)
 
         if expired_sessions:
-            print(f"🧹 Cleaned up {len(expired_sessions)} expired sessions")
+            logger.info("Cleaned up %d expired sessions", len(expired_sessions))
 
         return len(expired_sessions)
 

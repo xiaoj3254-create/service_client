@@ -7,6 +7,7 @@
 
 import os
 import json
+import logging
 import requests
 import time
 from typing import Dict, List, Any, Optional, TypedDict, Annotated
@@ -21,6 +22,8 @@ from pydantic import BaseModel
 
 # 加载环境变量
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # 导入配置
 from config import *
@@ -112,12 +115,19 @@ class OpenAICompatibleClient:
             "messages": formatted_messages
         }
 
-        # 添加调试信息
-        print(f"🔍 Debug: API request:")
-        print(f"   URL: {self.base_url}/chat/completions")
-        print(f"   Model: {self.model}")
-        print(f"   Messages: {len(formatted_messages)}")
-        print(f"   Format: {formatted_messages[:2]}...")  # 只显示前两条
+        # 调试日志：仅记录消息数量与角色分布，不打印消息正文（避免泄露用户隐私）
+        role_counts = {}
+        for m in formatted_messages:
+            r = m.get("role", "unknown")
+            role_counts[r] = role_counts.get(r, 0) + 1
+        logger.debug("API request: model=%s, messages=%d, roles=%s", self.model, len(formatted_messages), role_counts)
+        # 临时诊断：记录首条 user 消息的 content 前 80 字符（编码问题排查）
+        for m in formatted_messages:
+            if m.get("role") == "user":
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    logger.info("[诊断] 发往 LLM 的首条 user content=%r", c[:80])
+                break
 
         # 重试机制
         for attempt in range(self.max_retries):
@@ -141,7 +151,7 @@ class OpenAICompatibleClient:
                     return CustomResponse("API response format error")
 
             except requests.exceptions.RequestException as e:
-                print(f"❌ Debug: Attempt {attempt + 1} failed: {e}")
+                logger.warning("API attempt %d failed: %s", attempt + 1, e)
                 if attempt == self.max_retries - 1:
                     raise Exception(f"API call failed: {e}")
                 time.sleep(2 ** attempt)  # 指数退避
@@ -191,14 +201,13 @@ def get_llm():
     if _llm_instance is None:
         try:
             if not OPENAI_API_KEY:
-                print("❌ 错误: API密钥未设置，无法初始化LLM")
+                logger.error("API密钥未设置，无法初始化LLM")
                 _llm_instance = None
             else:
                 _llm_instance = initialize_llm_client()
-                print(f"✅ 成功初始化API客户端")
+                logger.info("成功初始化API客户端")
         except Exception as e:
-            print(f"❌ 初始化API客户端失败: {e}")
-            print("将使用模拟响应模式")
+            logger.exception("初始化API客户端失败，将使用模拟响应模式")
             _llm_instance = None
     return _llm_instance
 
@@ -286,11 +295,11 @@ def classify_query_node(state: AgentState) -> AgentState:
             result = classify_query.invoke({"query": customer_query, "llm": llm_instance})
             query_type = result
         except Exception as e:
-            print(f"Error in tool invocation: {e}")
+            logger.warning("分类工具调用失败，回退到保守兜底: %s", e)
             # 回退到保守兜底
             query_type = "out_of_scope"
     except Exception as e:
-        print(f"Error in query classification: {e}")
+        logger.exception("查询分类出错，回退到保守兜底")
         query_type = "out_of_scope"
 
     # 更新状态
@@ -324,7 +333,7 @@ def classify_query_node(state: AgentState) -> AgentState:
     try:
         session_manager.add_message(session_id, str(customer_query), is_user=True)
     except Exception as e:
-        print(f"Error adding user message to session: {e}")
+        logger.warning("添加用户消息到会话失败: %s", e)
 
     # 护栏：超出范围直接固定回复，不进入业务智能体
     if state["query_type"] == "out_of_scope":
@@ -341,7 +350,7 @@ def classify_query_node(state: AgentState) -> AgentState:
         try:
             session_manager.add_message(session_id, OUT_OF_SCOPE_REPLY, is_user=False)
         except Exception as e:
-            print(f"Error adding out_of_scope refusal to session: {e}")
+            logger.warning("添加越界拒答到会话失败: %s", e)
         state["tools_used"].append("out_of_scope_refusal")
         return state
 
@@ -361,11 +370,11 @@ def create_agent_node(agent_name: str):
             result = agent.process(state)
 
             if not isinstance(result, dict):
-                print(f"Agent {agent_name} returned non-dict result: {type(result)}")
+                logger.error("Agent %s 返回非dict结果: %s", agent_name, type(result))
                 result = {"response": "Error: Agent processing failed", "current_agent": agent_name}
 
             if "response" not in result:
-                print(f"Agent {agent_name} result missing 'response' field: {result}")
+                logger.error("Agent %s 结果缺少response字段", agent_name)
                 result["response"] = "Error: No response from agent"
 
             # 助手轮次写入 checkpointer 状态
@@ -381,7 +390,7 @@ def create_agent_node(agent_name: str):
             try:
                 session_manager.add_message(session_id, str(result["response"]), is_user=False)
             except Exception as e:
-                print(f"Error adding AI message to session: {e}")
+                logger.warning("添加AI消息到会话失败: %s", e)
 
             return result
         else:
@@ -412,7 +421,7 @@ def get_default_checkpointer():
     if _default_checkpointer is None:
         from langgraph.checkpoint.memory import InMemorySaver
         _default_checkpointer = InMemorySaver()
-        print("✅ 已启用默认 InMemorySaver checkpointer（进程内持久化）")
+        logger.info("已启用默认 InMemorySaver checkpointer（进程内持久化）")
     return _default_checkpointer
 
 
@@ -474,14 +483,21 @@ def make_graph(checkpointer=None):
     workflow.set_finish_point("final_response")
 
     # 编译工作流：显式挂载 checkpointer，保证 persisted_dialogue 真正被持久化
+    # - 独立运行（python multi_agent_customer_service.py）：checkpointer=None，使用进程内 InMemorySaver
+    # - 平台托管（langgraph dev/CLI）：平台会注入 dict 形式的配置描述，
+    #   此时不能传给 compile()，应交由平台自行管理 checkpointer
     if checkpointer is None:
         checkpointer = get_default_checkpointer()
+    elif isinstance(checkpointer, dict):
+        # 平台注入的配置 dict，非合法 saver 实例，传 None 让平台托管
+        logger.info("检测到平台注入的 checkpointer 配置，交由 LangGraph 平台托管持久化")
+        checkpointer = None
     app = workflow.compile(checkpointer=checkpointer)
 
-    print("✅ LangGraph工作流图构建完成（已挂载 checkpointer）")
+    logger.info("LangGraph工作流图构建完成（已挂载 checkpointer）")
     return app
 
 # 创建默认工作流实例
 if __name__ == "__main__":
     app = make_graph()
-    print("🚀 多智能体客服系统启动成功！")
+    logger.info("多智能体客服系统启动成功！")
