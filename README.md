@@ -14,6 +14,15 @@
 - **会话持久化**：LangGraph checkpointer（TTL 12 小时，每 10 分钟清理）
 - **知识存储**：LangGraph store（TTL 7 天）
 
+
+
+## 多轮对话
+![多轮对话](./doc/chat-his.png)
+
+## 工作流
+![工作流](./doc/chat-graph.png)
+
+
 ## 系统架构
 
 ```
