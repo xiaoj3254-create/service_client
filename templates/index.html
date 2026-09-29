@@ -2140,6 +2140,9 @@
             isTyping = true;
             updateComposerSendReady();
 
+            // 流式气泡上下文（出错时用于清理未完成的空壳）
+            let streamCtx = null;
+
             try {
                 const requestBody = {
                     message: message,
@@ -2149,7 +2152,7 @@
                     requestBody.images = imagesToSend;
                 }
 
-                const response = await fetch('/api/chat', {
+                const response = await fetch('/api/chat/stream', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -2161,31 +2164,79 @@
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
 
-                const data = await response.json();
+                // 先建空助手气泡，边收边渲染（打字机效果）
+                streamCtx = createStreamingBubble();
+                let donePayload = null;
+                let streamError = '';
 
-                if (data.error) {
-                    addMessage('assistant', '抱歉，系统出现错误：' + data.error);
-                    console.error('聊天API错误:', data.error);
-                } else if (data.response) {
-                    addMessage('assistant', data.response);
-                    // 插在「本条」助手气泡内；勿在 addMessage 之前选取 :last-child，否则会误插在上一轮回复上造成「两条回复」观感
-                    if (data.agent || data.query_type) {
-                        var agentInfo = document.createElement('div');
-                        agentInfo.className = 'agent-info';
-                        agentInfo.textContent =
-                            '🤖 ' + (data.agent || '智能客服')
-                            + ' | 📋 ' + (data.query_type || '已处理');
-
-                        var lastAssistantContent = document.querySelector(
-                            '.message.assistant:last-child .message-content'
-                        );
-                        if (lastAssistantContent) {
-                            lastAssistantContent.insertBefore(agentInfo, lastAssistantContent.firstChild);
-                        }
+                await consumeSSE(response.body, function (evt) {
+                    if (evt.error) {
+                        streamError = evt.error;
+                        return;
                     }
-                } else {
-                    addMessage('assistant', '抱歉，系统返回了空响应，请稍后重试。');
-                    console.warn('聊天API返回空响应:', data);
+                    if (evt.type === 'status' && evt.content) {
+                        // 分类等前置阶段的进度反馈：仅在尚无正文时更新「思考中」文案
+                        if (streamCtx && !streamCtx.text) showTypingIndicator(evt.content);
+                        return;
+                    }
+                    if (evt.type === 'done') {
+                        donePayload = evt;
+                        return;
+                    }
+                    if (evt.type === 'token' && evt.content) {
+                        appendStreamChunk(streamCtx, evt.content);
+                        return;
+                    }
+                    // 兼容旧的整段格式（后端轮询兜底路径）
+                    if (evt.content && !evt.type) {
+                        appendStreamChunk(streamCtx, evt.content);
+                        donePayload = evt;
+                    }
+                });
+
+                if (!streamCtx.text) {
+                    // 一个字都没收到：移除空壳，改用提示气泡
+                    const emptyRoot = streamCtx.root;
+                    streamCtx = null;
+                    emptyRoot.remove();
+                    updateChatEmptyVisibility();
+                    if (streamError) {
+                        console.error('流式聊天错误:', streamError);
+                        addMessage('assistant', '抱歉，系统出现错误：' + streamError);
+                    } else {
+                        addMessage('assistant', '抱歉，系统返回了空响应，请稍后重试。');
+                    }
+                    return;
+                }
+
+                // 用服务端完整文本校准一次，保证屏幕内容与线程 state 一致（历史回显不会对不上）
+                if (donePayload && donePayload.content && donePayload.content !== streamCtx.text) {
+                    streamCtx.text = donePayload.content;
+                }
+                finishStreamingBubble(streamCtx);
+                streamCtx = null;
+
+                if (streamError) {
+                    console.error('流式聊天错误:', streamError);
+                }
+
+                const data = donePayload || {};
+
+                // 插入本轮智能体标签（后端返回 agent / query_type 时才插）
+                // 勿提前选取 :last-child，否则会误插在上一轮回复上造成「两条回复」观感
+                if (data.agent || data.query_type) {
+                    var agentInfo = document.createElement('div');
+                    agentInfo.className = 'agent-info';
+                    agentInfo.textContent =
+                        '🤖 ' + (data.agent || '智能客服')
+                        + ' | 📋 ' + (data.query_type || '已处理');
+
+                    var lastAssistantContent = document.querySelector(
+                        '.message.assistant:last-child .message-content'
+                    );
+                    if (lastAssistantContent) {
+                        lastAssistantContent.insertBefore(agentInfo, lastAssistantContent.firstChild);
+                    }
                 }
 
                 // 首条消息后后端返回真实 LangGraph 线程ID：
@@ -2199,6 +2250,13 @@
                 refreshSessionList();
             } catch (error) {
                 console.error('发送消息失败:', error);
+                // 清理可能已创建但未完成的流式空壳，避免残留空气泡
+                if (streamCtx) {
+                    const failedRoot = streamCtx.root;
+                    streamCtx = null;
+                    failedRoot.remove();
+                    updateChatEmptyVisibility();
+                }
                 addMessage('assistant', '抱歉，网络连接出现问题，请稍后重试。错误详情：' + error.message);
             } finally {
                 hideTypingIndicator();
@@ -2283,6 +2341,154 @@
         }
 
         // 添加消息到界面
+        // ==================== 流式输出（SSE） ====================
+
+        /**
+         * 逐块读取 SSE 响应体，按空行切分事件块后回调。
+         * TextDecoder({stream:true}) 处理跨 chunk 的多字节字符；保留未结束的尾部缓冲，
+         * 避免一条 JSON 被切在两个网络分片里导致解析失败。
+         */
+        async function consumeSSE(stream, onEvent) {
+            if (!stream) throw new Error('响应体不可读');
+            const reader = stream.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+                    if (done) break;
+
+                    let sepIdx;
+                    while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
+                        const block = buffer.slice(0, sepIdx);
+                        buffer = buffer.slice(sepIdx + 2);
+                        handleSSEBlock(block, onEvent);
+                    }
+                }
+                // 流结束：处理残留的最后一个事件块
+                if (buffer.trim()) handleSSEBlock(buffer, onEvent);
+            } finally {
+                try { reader.releaseLock(); } catch (e) { /* 流已关闭，忽略 */ }
+            }
+        }
+
+        /** 解析单个 SSE 事件块（可能含多行 data:），把 JSON 载荷交给回调。 */
+        function handleSSEBlock(block, onEvent) {
+            var dataLines = [];
+            String(block).split('\n').forEach(function (line) {
+                if (line.indexOf('data:') === 0) {
+                    dataLines.push(line.slice(5).trim());
+                }
+            });
+            if (dataLines.length === 0) return;
+
+            var raw = dataLines.join('\n');
+            if (raw === '[DONE]') return;   // 结束标记，无需向下传
+
+            var payload = null;
+            try {
+                payload = JSON.parse(raw);
+            } catch (e) {
+                console.warn('[stream] 无法解析的 SSE 载荷:', raw);
+                return;
+            }
+            onEvent(payload);
+        }
+
+        /**
+         * 创建流式助手气泡：先建空壳，随后逐块填充形成打字机效果。
+         * 返回的 ctx 持有 body 节点与累积文本，供 appendStreamChunk / finishStreamingBubble 使用。
+         */
+        function createStreamingBubble() {
+            const chatContainer = document.getElementById('chatContainer');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+
+            const body = document.createElement('div');
+            body.className = 'message-body';
+            contentDiv.appendChild(body);
+
+            messageDiv.appendChild(contentDiv);
+            chatContainer.appendChild(messageDiv);
+            updateChatEmptyVisibility();
+
+            return {
+                root: messageDiv,
+                contentDiv: contentDiv,
+                body: body,
+                text: '',
+                rafId: null,
+                firstChunk: true
+            };
+        }
+
+        /**
+         * 追加一段流式文本。
+         * - requestAnimationFrame 节流：LLM 每秒可吐几十个 token，逐个改 DOM 会掉帧
+         * - 流式期间只用纯文本：Markdown 留到收尾一次性渲染，
+         *   否则未闭合语法（如 ``` 代码块）会在中途闪烁错乱
+         */
+        function appendStreamChunk(ctx, chunk) {
+            if (!ctx || !chunk) return;
+            ctx.text += chunk;
+
+            if (ctx.firstChunk) {
+                ctx.firstChunk = false;
+                // 首个 token 到达：收起「正在输入」指示器，避免与打字机气泡同屏
+                hideTypingIndicator();
+            }
+
+            if (ctx.rafId !== null) return;
+            ctx.rafId = window.requestAnimationFrame(function () {
+                ctx.rafId = null;
+                ctx.body.textContent = ctx.text;
+                var chatContainer = document.getElementById('chatContainer');
+                if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
+            });
+        }
+
+        /**
+         * 流式收尾：取消挂起帧 -> 一次性 Markdown 渲染 -> 补元信息与复制按钮。
+         * 终态与 addMessage('assistant', ...) 保持一致。
+         */
+        function finishStreamingBubble(ctx, tsOpt) {
+            if (!ctx) return;
+
+            if (ctx.rafId !== null) {
+                window.cancelAnimationFrame(ctx.rafId);
+                ctx.rafId = null;
+            }
+
+            const text = ctx.text;
+            ctx.body.innerHTML = '';
+            if (text) {
+                // 复用既有 Markdown 管线（marked + DOMPurify）；CDN 不可用时回退纯文本
+                let appliedMarkdown = false;
+                if (canUseMarkdownPipeline()) {
+                    try {
+                        const dirty = marked.parse(text, { breaks: false, gfm: true });
+                        ctx.body.innerHTML = DOMPurify.sanitize(dirty);
+                        ctx.body.classList.add('md-body');
+                        appliedMarkdown = true;
+                    } catch (e) {
+                        console.warn('[markdown] 流式收尾解析失败，回退为原始展示:', e);
+                    }
+                }
+                if (!appliedMarkdown) ctx.body.textContent = text;
+            }
+
+            attachMessageMeta(ctx.contentDiv, '智能客服', tsOpt);
+            insertMessageActionsBeforeMeta(ctx.contentDiv, ctx.root);
+
+            const chatContainer = document.getElementById('chatContainer');
+            if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
         function addMessage(role, content, tsOpt, imageUrls) {
             const chatContainer = document.getElementById('chatContainer');
             const messageDiv = document.createElement('div');
@@ -2367,8 +2573,10 @@
             updateChatEmptyVisibility();
         }
 
-        // 显示输入指示器
-        function showTypingIndicator() {
+        // 显示输入指示器；传入 statusText 时替换文案（分类等前置阶段的进度反馈）
+        function showTypingIndicator(statusText) {
+            var dots = document.querySelector('#typingIndicator .typing-dots');
+            if (dots) dots.textContent = statusText || '智能体正在思考中';
             document.getElementById('typingIndicator').style.display = 'block';
             document.getElementById('chatContainer').scrollTop = document.getElementById('chatContainer').scrollHeight;
         }

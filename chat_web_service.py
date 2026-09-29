@@ -12,7 +12,7 @@ import os
 import time
 import datetime as _dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 LANGGRAPH_API_URL: str = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
 LANGGRAPH_GRAPH_NAME: str = os.getenv("LANGGRAPH_GRAPH_NAME", "customer_service")
+
+# 连接 LangGraph 的超时（秒）
+LANGGRAPH_CONNECT_TIMEOUT: float = float(os.getenv("LANGGRAPH_CONNECT_TIMEOUT", "10"))
+# 两个 SSE 事件之间的最大静默时间（秒）。注意这是「每次读取」的超时，不是整个请求的总时长：
+# run 若在服务端排队（例如被僵尸 run 占住 worker），连接虽已建立但永不出数据，
+# 靠它主动报错，避免浏览器一直转圈无反馈。默认 120s，兼顾冷启动慢的情况。
+LANGGRAPH_SILENCE_TIMEOUT: float = float(
+    os.getenv("LANGGRAPH_SILENCE_TIMEOUT", os.getenv("LANGGRAPH_STREAM_READ_TIMEOUT", "120"))
+)
 
 # 助手ID缓存（创建后只读，可安全跨请求复用）
 _assistant_id: Optional[str] = None
@@ -537,29 +546,93 @@ def run_chat_sync(
         return None, f'内部错误: {str(e)}', 500, thread_id
 
 
+def _sse(payload: Dict[str, Any]) -> str:
+    """把字典编码为一行 SSE data（ensure_ascii=False，便于日志直读中文）。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _iter_langgraph_sse(response) -> Iterator[Tuple[str, Any]]:
+    """
+    解析 LangGraph /runs/stream 返回的 SSE 流，产出 (event_name, data_obj)。
+
+    SSE 事件块以空行分隔，字段形如 `event: custom` / `data: {...}`。
+    自行按 utf-8 解码 bytes，避免 decode_unicode 猜错编码导致中文乱码。
+    """
+    event_name: Optional[str] = None
+    data_lines: List[str] = []
+
+    def _flush(evt: Optional[str], lines: List[str]) -> Tuple[str, Any]:
+        raw = "\n".join(lines)
+        try:
+            return (evt or "message"), json.loads(raw)
+        except ValueError:
+            return (evt or "message"), raw
+
+    for raw_line in response.iter_lines():
+        if raw_line is None:
+            continue
+        line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else raw_line
+
+        if line == "":
+            if data_lines:
+                yield _flush(event_name, data_lines)
+            event_name, data_lines = None, []
+            continue
+        if line.startswith(":"):
+            # 注释行（心跳），忽略
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+
+    # 流末尾若没有以空行收尾，补发最后一个事件
+    if data_lines:
+        yield _flush(event_name, data_lines)
+
+
 def stream_chat_events(
     user_message: str,
     client_session_id: Optional[str] = None,
     images: Optional[List[str]] = None,
 ) -> Iterable[str]:
     """
-    生成 SSE data 行（含末尾 [DONE]），供 Flask Response 逐块写出。
-    images: 可选的客户图片 data URL 列表。
+    以 SSE 转发 LangGraph 的流式运行结果，实现真正的逐 token 推流。
+
+    走 POST /threads/{tid}/runs/stream，stream_mode 取：
+    - "custom" ：graph 节点内用 get_stream_writer() 写入的 token 片段
+    - "updates"：节点增量状态，用于取最终完整回复 / current_agent / query_type 兜底
+
+    推送事件格式：
+    - {"type": "token", "content": "..."}                 逐块正文
+    - {"type": "done", "content": "完整正文", "session_id": ..., "thread_id": ...,
+       "agent": ..., "query_type": ...}                   收尾
+    - {"error": "..."}                                    错误
+    - data: [DONE]                                        流结束标记
+
+    健壮性：/runs/stream 不可用、或一个 token 都没收到时，自动退回
+    _stream_chat_events_by_polling（原轮询实现），保证行为不退化。
     """
     if not user_message.strip():
-        yield f"data: {json.dumps({'error': '消息不能为空'})}\n\n"
+        yield _sse({'error': '消息不能为空'})
         yield "data: [DONE]\n\n"
         return
 
+    # 立即吐一个事件：werkzeug 只有在生成器「首次 yield」时才会写响应头。
+    # 若不在最前面发一个，下面「助手校验 → 线程校验 → 提交 run」期间后端一旦阻塞
+    # （典型场景：服务端 run 在队列里排队），浏览器会一直处于「请求 pending、毫无反馈」，
+    # 看起来像前端卡死。先发一个事件即可让响应头立刻返回，前端马上有反馈。
+    yield _sse({"type": "status", "content": "正在接入客服…"})
+
     asst_ok, assistant_id = ensure_assistant_exists()
     if not asst_ok:
-        yield f"data: {json.dumps({'error': '无法创建或找到助手'})}\n\n"
+        yield _sse({'error': '无法创建或找到助手'})
         yield "data: [DONE]\n\n"
         return
 
     thread_ok, thread_id = ensure_thread_exists(client_session_id)
     if not thread_ok:
-        yield f"data: {json.dumps({'error': '无法创建线程'})}\n\n"
+        yield _sse({'error': '无法创建线程'})
         yield "data: [DONE]\n\n"
         return
 
@@ -574,43 +647,193 @@ def stream_chat_events(
     if images:
         stream_run_input["customer_images"] = images
 
+    sid = thread_id
+    streamed_any = False
+    # run 是否已成功提交：提交成功后绝不再回退轮询重跑（重跑会再排一个 run，加重服务端排队）
+    run_submitted = False
+    accumulated: List[str] = []
+    fallback_text: Optional[str] = None
+    final_agent = ""
+    final_query_type = ""
+
     try:
         response = requests.post(
-            f"{LANGGRAPH_API_URL}/threads/{thread_id}/runs",
+            f"{LANGGRAPH_API_URL}/threads/{sid}/runs/stream",
             json={
                 "assistant_id": assistant_id,
-                "input": stream_run_input
+                "input": stream_run_input,
+                "stream_mode": ["custom", "updates"],
             },
-            timeout=30
+            timeout=(LANGGRAPH_CONNECT_TIMEOUT, LANGGRAPH_SILENCE_TIMEOUT),
+            stream=True,
         )
 
         if response.status_code != 200:
-            yield f"data: {json.dumps({'error': f'流式调用失败: {response.status_code}'})}\n\n"
+            # 提交阶段即失败：此时服务端没有我们的 run 在跑，回退轮询是安全的
+            logger.warning("runs/stream 返回 %s，回退到轮询式实现", response.status_code)
+            response.close()
+            yield from _stream_chat_events_by_polling(user_message, sid, assistant_id, stream_run_input)
+            return
+
+        # 从这里开始服务端已有我们的 run，后续任何失败都不再重跑
+        run_submitted = True
+
+        try:
+            for event_name, payload in _iter_langgraph_sse(response):
+                if event_name == "custom":
+                    if not isinstance(payload, dict):
+                        continue
+                    evt_type = payload.get("type")
+                    if evt_type == "status":
+                        # 阶段性状态（如「正在识别您的问题类型…」）：原样透传给前端展示。
+                        # 不计入正文，也不影响 streamed_any（否则会出现空气泡）
+                        yield _sse({"type": "status", "content": payload.get("content") or ""})
+                    elif evt_type == "token":
+                        piece = payload.get("content")
+                        if piece:
+                            streamed_any = True
+                            accumulated.append(str(piece))
+                            yield _sse({"type": "token", "content": piece})
+                elif event_name.startswith("update"):
+                    # payload 形如 {node_name: state_delta}
+                    if not isinstance(payload, dict):
+                        continue
+                    for node_name, delta in payload.items():
+                        if not isinstance(delta, dict):
+                            continue
+                        resp_text = delta.get("response")
+                        if node_name == "final_response":
+                            # final_response 会给正文加【xx's Response】前缀：
+                            # 仅在拿不到更干净的 agent 原始回复时才用它兜底
+                            if resp_text and not fallback_text:
+                                fallback_text = str(resp_text)
+                            continue
+                        if resp_text:
+                            fallback_text = str(resp_text)
+                            final_agent = delta.get("current_agent") or final_agent
+                            final_query_type = delta.get("query_type") or final_query_type
+        finally:
+            response.close()
+
+    except Exception as e:
+        # 注意：requests 在 iter_lines 内部会把 ReadTimeout 包装成
+        # ConnectionError("Read timed out.")，因此按「类型 + 文案」双重判定，否则会漏判。
+        is_timeout = isinstance(e, requests.exceptions.Timeout) or "timed out" in str(e).lower()
+
+        if is_timeout and not streamed_any:
+            # 静默超时：连接已建立但服务端长时间不发任何数据。
+            # 最常见原因是 run 在服务端队列里排队（例如被僵尸 run 占住 worker）。
+            logger.warning(
+                "流式静默超时：%.0fs 内未收到任何事件（%s）",
+                LANGGRAPH_SILENCE_TIMEOUT, type(e).__name__,
+            )
+            yield _sse({
+                'error': f'客服响应超时（{int(LANGGRAPH_SILENCE_TIMEOUT)} 秒内无响应，可能正在排队），请稍后重试'
+            })
             yield "data: [DONE]\n\n"
             return
 
-        result = response.json()
-        run_id = result.get("run_id")
+        logger.exception("流式转发出错")
+        if not streamed_any and not run_submitted:
+            # run 从未提交成功 → 回退轮询是安全的
+            logger.warning("流式未产出任何内容且 run 未提交，回退到轮询式实现")
+            yield from _stream_chat_events_by_polling(user_message, sid, assistant_id, stream_run_input)
+            return
+        if not streamed_any:
+            # run 已提交但没有任何产出：不再重跑（重跑会再排一个 run，加重服务端排队）
+            logger.warning("run 已提交但无任何产出，直接报错不再重跑")
+            yield _sse({'error': '客服处理超时或服务繁忙，请稍后重试'})
+            yield "data: [DONE]\n\n"
+            return
+        # 已推给前端部分正文：用已累积内容收尾，绝不重跑（否则前端会看到重复文本）
+        yield _sse({
+            "type": "done",
+            "content": "".join(accumulated),
+            "session_id": sid,
+            "thread_id": sid,
+            "agent": final_agent,
+            "query_type": final_query_type,
+            "truncated": True,
+        })
+        yield "data: [DONE]\n\n"
+        return
 
+    full_text = "".join(accumulated)
+    if not full_text:
+        if not fallback_text:
+            # 既无 token 也无最终文本：退回轮询实现再取一次完整回复
+            logger.warning("流式通道无任何输出，回退到轮询式实现")
+            yield from _stream_chat_events_by_polling(user_message, sid, assistant_id, stream_run_input)
+            return
+        # 有完整文本但没有流式片段（例：LLM 走了非流式回退）：整段补发一次
+        full_text = fallback_text
+        yield _sse({"type": "token", "content": full_text})
+
+    yield _sse({
+        "type": "done",
+        "content": full_text,
+        "session_id": sid,
+        "thread_id": sid,
+        "agent": final_agent,
+        "query_type": final_query_type,
+    })
+    yield "data: [DONE]\n\n"
+
+
+def _stream_chat_events_by_polling(
+    user_message: str,
+    thread_id: str,
+    assistant_id: str,
+    run_input: Dict[str, Any],
+) -> Iterable[str]:
+    """
+    兜底实现：提交 run 后轮询运行状态，结束后一次性取回完整回复。
+
+    仅在 /runs/stream 不可用、或流式通道一个 token 都没产出时调用，
+    保证「真流式不可用时功能不退化」。事件格式与 stream_chat_events 一致。
+    """
+    tid = thread_id
+    # 告知前端已切入兼容模式，避免等待期毫无反馈
+    yield _sse({"type": "status", "content": "正在切换兼容模式处理…"})
+
+    try:
+        response = requests.post(
+            f"{LANGGRAPH_API_URL}/threads/{tid}/runs",
+            json={"assistant_id": assistant_id, "input": run_input},
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            yield _sse({'error': f'流式调用失败: {response.status_code}'})
+            yield "data: [DONE]\n\n"
+            return
+
+        run_id = response.json().get("run_id")
         if not run_id:
-            yield f"data: {json.dumps({'error': '无法获取运行ID'})}\n\n"
+            yield _sse({'error': '无法获取运行ID'})
             yield "data: [DONE]\n\n"
             return
 
-        tid = thread_id
         run_status = "running"
+        max_wait_time = 120
+        wait_start = time.time()
+
         while run_status in ["running", "pending"]:
+            if time.time() - wait_start > max_wait_time:
+                yield _sse({'error': '运行超时'})
+                yield "data: [DONE]\n\n"
+                return
+
             time.sleep(0.5)
             status_response = requests.get(
                 f"{LANGGRAPH_API_URL}/threads/{tid}/runs/{run_id}",
                 timeout=10
             )
             if status_response.status_code != 200:
-                yield f"data: {json.dumps({'error': f'获取运行状态失败: {status_response.status_code}'})}\n\n"
+                yield _sse({'error': f'获取运行状态失败: {status_response.status_code}'})
                 break
 
-            run_data = status_response.json()
-            run_status = run_data.get("status", "unknown")
+            run_status = status_response.json().get("status", "unknown")
 
             if run_status in ["completed", "success"]:
                 thread_response = requests.get(
@@ -618,22 +841,28 @@ def stream_chat_events(
                     timeout=10
                 )
                 if thread_response.status_code == 200:
-                    thread_state = thread_response.json()
-                    ai_response = extract_ai_response(thread_state)
-                    yield f"data: {json.dumps({'content': ai_response, 'session_id': tid, 'thread_id': tid})}\n\n"
+                    ai_response = extract_ai_response(thread_response.json())
+                    if ai_response:
+                        yield _sse({"type": "token", "content": ai_response})
+                    yield _sse({
+                        "type": "done",
+                        "content": ai_response or "",
+                        "session_id": tid,
+                        "thread_id": tid,
+                    })
                 else:
-                    yield f"data: {json.dumps({'error': '无法获取线程状态'})}\n\n"
+                    yield _sse({'error': '无法获取线程状态'})
                 break
 
             if run_status in ["failed", "cancelled"]:
-                yield f"data: {json.dumps({'error': f'运行失败: {run_status}'})}\n\n"
+                yield _sse({'error': f'运行失败: {run_status}'})
                 break
         else:
-            yield f"data: {json.dumps({'error': '运行超时'})}\n\n"
+            yield _sse({'error': '运行超时'})
 
     except Exception as e:
-        logger.exception("流式处理错误")
-        yield f"data: {json.dumps({'error': f'流式处理错误: {str(e)}'})}\n\n"
+        logger.exception("轮询式流式处理错误")
+        yield _sse({'error': f'流式处理错误: {str(e)}'})
 
     yield "data: [DONE]\n\n"
 

@@ -176,7 +176,13 @@ def chat_stream():
 
         return Response(
             stream_chat_events(user_message, client_session_id, images=image_data),
-            mimetype='text/event-stream'
+            mimetype='text/event-stream',
+            headers={
+                # 反缓冲：本地 Flask 直连本就不缓冲，但 nginx/网关默认会缓冲整个响应，
+                # 会导致流式退化成「攒完一次性返回」，这里显式关闭。
+                'Cache-Control': 'no-cache, no-transform',
+                'X-Accel-Buffering': 'no',
+            }
         )
 
     except Exception as e:

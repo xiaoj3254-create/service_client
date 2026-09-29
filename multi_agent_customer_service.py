@@ -61,6 +61,9 @@ class AgentState(TypedDict):
     # 客户上传的图片列表（data URL，如 "data:image/jpeg;base64,..."）；无图时为 None
     customer_images: Optional[List[str]]
 
+# 流式请求的连接超时（秒）：与整体读取超时分开，避免长回复被总超时误杀
+HTTP_CONNECT_TIMEOUT = int(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+
 # OpenAI兼容API客户端类
 class OpenAICompatibleClient:
     def __init__(self, api_key: str, base_url: str, model: str):
@@ -83,11 +86,12 @@ class OpenAICompatibleClient:
         self.inheritable_tags = []
         self.inheritable_metadata = {}
 
-    def invoke(self, messages):
-        """调用OpenAI兼容API"""
-        # 格式化消息
-        # 注意：msg.content 为 list 时是多模态消息（含 image_url 片段），
-        # 结构本身即 OpenAI 兼容协议格式（mimo-v2.5 图片理解），需原样透传不可转字符串。
+    def _format_messages(self, messages) -> List[Dict[str, Any]]:
+        """把 LangChain 消息对象 / 纯字符串统一转成 OpenAI 兼容的 messages 列表。
+
+        注意：msg.content 为 list 时是多模态消息（含 image_url 片段），
+        结构本身即 OpenAI 兼容协议格式（mimo-v2.5 图片理解），需原样透传不可转字符串。
+        """
         formatted_messages = []
         for msg in messages:
             if hasattr(msg, 'content'):
@@ -108,12 +112,18 @@ class OpenAICompatibleClient:
             else:
                 # 处理字符串或其他类型
                 formatted_messages.append({"role": "user", "content": str(msg)})
+        return formatted_messages
 
-        # 构建请求payload
-        payload = {
+    def _build_payload(self, messages, stream: bool = False) -> Dict[str, Any]:
+        """构造 chat/completions 请求体；stream=False 时不带 stream 字段，保持对旧网关的兼容。"""
+        formatted_messages = self._format_messages(messages)
+
+        payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": formatted_messages
+            "messages": formatted_messages,
         }
+        if stream:
+            payload["stream"] = True
 
         # 调试日志：仅记录消息数量与角色分布，不打印消息正文（避免泄露用户隐私）
         role_counts = {}
@@ -128,6 +138,12 @@ class OpenAICompatibleClient:
                 if isinstance(c, str):
                     logger.info("[诊断] 发往 LLM 的首条 user content=%r", c[:80])
                 break
+
+        return payload
+
+    def invoke(self, messages):
+        """调用OpenAI兼容API（非流式）"""
+        payload = self._build_payload(messages)
 
         # 重试机制
         for attempt in range(self.max_retries):
@@ -155,6 +171,52 @@ class OpenAICompatibleClient:
                 if attempt == self.max_retries - 1:
                     raise Exception(f"API call failed: {e}")
                 time.sleep(2 ** attempt)  # 指数退避
+
+    def stream_invoke(self, messages):
+        """
+        流式调用 OpenAI 兼容 API：逐块 yield 增量文本（delta.content）。
+
+        设计约定：
+        - 不在此方法内重试：已产出 token 后再重试会产生重复内容。
+          调用方若「一块都没收到」就失败，可安全回退到 invoke()。
+        - iter_lines() 返回 bytes，自行按 utf-8 解码；不用 decode_unicode=True
+          （其依赖 response.encoding 猜编码，中文场景会乱码）。
+        - timeout 用 (连接超时, 读取超时) 元组，避免长回复被总超时中断。
+        """
+        payload = self._build_payload(messages, stream=True)
+
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers=self.headers,
+            timeout=(HTTP_CONNECT_TIMEOUT, self.timeout),
+            stream=True,
+        )
+        response.raise_for_status()
+
+        try:
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    logger.debug("跳过无法解析的流式分片: %r", data[:120])
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                piece = (choices[0].get("delta") or {}).get("content")
+                if piece:
+                    yield piece
+        finally:
+            response.close()
 
     def chat(self, messages):
         """兼容LangChain的chat方法"""
@@ -235,9 +297,26 @@ def get_agent(agent_name: str):
         _agent_instances[agent_name] = agent
     return _agent_instances[agent_name]
 
+def _push_stream_status(text: str) -> None:
+    """
+    向 LangGraph custom 流通道推送一条阶段性状态，供前端在等待期展示进度。
+
+    仅在流式上下文（平台/CLI 以 stream_mode="custom" 运行）中生效；
+    非流式运行（独立脚本、直接调用节点）会取不到 writer，静默忽略。
+    """
+    try:
+        from langgraph.config import get_stream_writer
+        get_stream_writer()({"type": "status", "content": text})
+    except Exception:
+        pass
+
+
 # 定义查询分类节点
 def classify_query_node(state: AgentState) -> AgentState:
     """Classify customer query"""
+    # 分类必须先阻塞调用一次 LLM 才能确定路由，用户侧会有十几秒空白，先给个进度反馈
+    _push_stream_status("正在识别您的问题类型…")
+
     try:
         cfg = get_config()  # 当前 graph 运行时的 `RunnableConfig` 对象
         tid = (cfg.get("configurable") or {}).get("thread_id")

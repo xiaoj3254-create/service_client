@@ -108,19 +108,68 @@ class BaseAgent(ABC):
         else:
             messages.append(self._build_human_message(customer_query, state))
 
-        # 调用LLM
-        try:
-            response = self.llm.invoke(messages)
-            response_content = response.content
-        except Exception as e:
-            logger.warning("%s 调用LLM时出错: %s", self.name, e)
-            response_content = self._get_error_fallback()
+        # 调用LLM（流式优先，不可用/失败自动回退非流式）
+        response_content = self._call_llm(messages)
 
         state["response"] = response_content
         state["current_agent"] = self.name
         state["tools_used"].append(f"{self.name}_processing")
 
         return state
+
+    def _call_llm(self, messages) -> str:
+        """
+        调用 LLM 获取回复文本，流式优先。
+
+        处于 LangGraph 流式上下文（以 stream_mode="custom" 运行）时，用 get_stream_writer()
+        拿到的 writer 逐个 token 推给前端，实现打字机效果；同时累积完整文本返回，
+        保证 state["response"] / persisted_dialogue / 侧栏预览与非流式路径完全一致。
+
+        以下任一情况都自动回退到原有阻塞 invoke()，行为与改动前一致：
+        - 非流式上下文（独立脚本运行、直接调用 process）
+        - LLM 客户端未提供 stream_invoke
+        - 流式调用在产出任何内容之前就失败
+        """
+        writer = None
+        try:
+            # 放在函数内导入：老版本 langgraph 无此接口时不影响模块导入
+            from langgraph.config import get_stream_writer
+            writer = get_stream_writer()
+        except Exception:
+            writer = None
+
+        stream_fn = getattr(self.llm, "stream_invoke", None)
+        if writer is not None and callable(stream_fn):
+            collected: List[str] = []
+            try:
+                for piece in stream_fn(messages):
+                    if not piece:
+                        continue
+                    collected.append(piece)
+                    try:
+                        writer({"type": "token", "content": piece})
+                    except Exception:
+                        # 推流失败不影响正文生成，静默降级为纯累积
+                        logger.debug("%s 推流失败，降级为纯累积模式", self.name)
+                if collected:
+                    return "".join(collected)
+                logger.warning("%s 流式调用未产出任何内容，回退非流式", self.name)
+            except Exception as e:
+                if collected:
+                    # 已产出部分内容：绝不回退重试，否则前端会看到重复文本
+                    logger.warning(
+                        "%s 流式中途失败（已产出 %d 块），返回已累积内容: %s",
+                        self.name, len(collected), e,
+                    )
+                    return "".join(collected)
+                logger.warning("%s 流式调用失败，回退非流式: %s", self.name, e)
+
+        try:
+            response = self.llm.invoke(messages)
+            return response.content
+        except Exception as e:
+            logger.warning("%s 调用LLM时出错: %s", self.name, e)
+            return self._get_error_fallback()
 
     def _get_conversation_context(
         self,
