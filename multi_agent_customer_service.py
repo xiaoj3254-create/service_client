@@ -131,14 +131,6 @@ class OpenAICompatibleClient:
             r = m.get("role", "unknown")
             role_counts[r] = role_counts.get(r, 0) + 1
         logger.debug("API request: model=%s, messages=%d, roles=%s", self.model, len(formatted_messages), role_counts)
-        # 临时诊断：记录首条 user 消息的 content 前 80 字符（编码问题排查）
-        for m in formatted_messages:
-            if m.get("role") == "user":
-                c = m.get("content", "")
-                if isinstance(c, str):
-                    logger.info("[诊断] 发往 LLM 的首条 user content=%r", c[:80])
-                break
-
         return payload
 
     def invoke(self, messages):
@@ -361,6 +353,8 @@ def classify_query_node(state: AgentState) -> AgentState:
         state["query_type"] = "out_of_scope"
         # 必须显式设置 next_agent：否则条件边会取默认值 general_agent，绕过护栏
         state["next_agent"] = "final_response"
+        # 补齐 current_agent，否则 final_response_node 取值会 KeyError 导致整个 run 失败
+        state["current_agent"] = "智能客服"
         return state
 
     # 使用分类工具
@@ -474,6 +468,8 @@ def create_agent_node(agent_name: str):
             return result
         else:
             state["response"] = f"Error: Agent {agent_name} not found"
+            # 补齐 current_agent，否则 final_response_node 取值会 KeyError 导致整个 run 失败
+            state["current_agent"] = agent_name
             return state
     return agent_node
 
@@ -540,7 +536,8 @@ def make_graph(checkpointer=None):
     # classify_query → 各智能体：根据 next_agent 路由（next_agent 在分类节点内设置）
     workflow.add_conditional_edges(
         "classify_query",
-        lambda x: x.get("next_agent", "") or "general_agent",
+        # 路由异常时保守拒答（与护栏哲学一致：路由不了就拒答，不放行业务智能体）
+        lambda x: x.get("next_agent", "") or "final_response",
         {
             "product_agent": "product_agent",
             "tech_agent": "tech_agent",

@@ -181,7 +181,15 @@ class BaseAgent(ABC):
         if state is not None:
             records = state.get("persisted_dialogue")
             if records:
-                tail = records[-max_messages:]
+                trimmed = list(records)
+                # classify 节点在路由前已把当前用户轮次写入 persisted_dialogue，
+                # 而当前查询随后会作为独立问题发送给 LLM；剔除末尾的当前轮次，
+                # 避免同一问题在 prompt 中出现两遍
+                if trimmed and trimmed[-1].get("is_user", True):
+                    trimmed = trimmed[:-1]
+                if not trimmed:
+                    return ""
+                tail = trimmed[-max_messages:]
                 context_lines = []
                 for msg in tail:
                     role = "用户" if msg.get("is_user", True) else "AI"

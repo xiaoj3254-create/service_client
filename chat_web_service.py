@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,6 +37,19 @@ LANGGRAPH_CONNECT_TIMEOUT: float = float(os.getenv("LANGGRAPH_CONNECT_TIMEOUT", 
 LANGGRAPH_SILENCE_TIMEOUT: float = float(
     os.getenv("LANGGRAPH_SILENCE_TIMEOUT", os.getenv("LANGGRAPH_STREAM_READ_TIMEOUT", "120"))
 )
+
+# 会话列表一次拉取的最大线程数。
+# LangGraph POST /threads/search 未传 limit 时默认只返回 10 条，会隐式截断历史会话；
+# 这里显式设置上限，避免 N+1 拉取无界增长，同时保证可见会话数符合预期。
+SESSION_LIST_LIMIT: int = int(os.getenv("SESSION_LIST_LIMIT", "30"))
+
+# 模块级 Session 复用 TCP 连接（keep-alive），避免每次调用 /threads/* 都重新握手。
+# HTTPAdapter 的连接池是线程安全的，可安全用于会话列表中的并发拉取。
+_http = requests.Session()
+_http.headers.update({"User-Agent": "MultiAgentCustomerService/1.0.0"})
+_http_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0)
+_http.mount("http://", _http_adapter)
+_http.mount("https://", _http_adapter)
 
 # 助手ID缓存（创建后只读，可安全跨请求复用）
 _assistant_id: Optional[str] = None
@@ -192,8 +206,12 @@ def ensure_assistant_exists() -> Tuple[bool, Optional[str]]:
     """确保 LangGraph 助手存在，不存在则创建。返回 (成功标志, assistant_id)。"""
     global _assistant_id
 
+    # 助手创建后不变，命中缓存直接返回，省去每条消息一次 /assistants/search 往返
+    if _assistant_id:
+        return True, _assistant_id
+
     try:
-        search_response = requests.post(
+        search_response = _http.post(
             f"{LANGGRAPH_API_URL}/assistants/search",
             json={
                 "graph_id": LANGGRAPH_GRAPH_NAME,
@@ -209,7 +227,7 @@ def ensure_assistant_exists() -> Tuple[bool, Optional[str]]:
                 logger.info("找到现有助手: %s", _assistant_id)
                 return True, _assistant_id
 
-        create_response = requests.post(
+        create_response = _http.post(
             f"{LANGGRAPH_API_URL}/assistants",
             json={
                 "graph_id": LANGGRAPH_GRAPH_NAME,
@@ -244,7 +262,7 @@ def ensure_thread_exists(client_session_id: Optional[str] = None) -> Tuple[bool,
     sid = client_session_id
     if sid and sid != 'default':
         try:
-            thread_response = requests.get(
+            thread_response = _http.get(
                 f"{LANGGRAPH_API_URL}/threads/{sid}",
                 timeout=5
             )
@@ -256,7 +274,7 @@ def ensure_thread_exists(client_session_id: Optional[str] = None) -> Tuple[bool,
             logger.warning("验证会话ID %s 时出错: %s，将创建新线程", sid, e)
 
     try:
-        response = requests.post(
+        response = _http.post(
             f"{LANGGRAPH_API_URL}/threads",
             json={},
             timeout=10
@@ -291,6 +309,10 @@ def _normalize_created_at(created_at: Any) -> float:
 def _message_count_from_state_data(state_data: Dict[str, Any]) -> int:
     if "values" in state_data and isinstance(state_data["values"], dict):
         values = state_data["values"]
+        # 与 conversation_history_from_state_data 的解析优先级对齐：
+        # persisted_dialogue 才是逐轮追加的完整对话（out_of_scope 轮次不写 conversation_history）
+        if isinstance(values.get("persisted_dialogue"), list):
+            return len(values["persisted_dialogue"])
         if "conversation_history" in values and values["conversation_history"]:
             return len(values["conversation_history"])
         if "messages" in values:
@@ -308,7 +330,7 @@ def _fetch_thread_state_info(thread_id: str) -> Tuple[int, str, str]:
     last_user_question = ""
     search_text = ""
     try:
-        state_response = requests.get(
+        state_response = _http.get(
             f"{LANGGRAPH_API_URL}/threads/{thread_id}/state",
             timeout=5
         )
@@ -336,7 +358,20 @@ def fetch_sessions_list() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]
     成功返回 (sessions, None)，失败返回 (None, error_message)。
     """
     try:
-        response = requests.post(f"{LANGGRAPH_API_URL}/threads/search", json={})
+        # 显式指定 limit / 排序 / 字段：
+        # - limit：不传时服务端默认仅返回 10 条，会隐式截断历史会话（同时把 N+1 拉取限定在上限内）
+        # - sort_by=updated_at desc：最近活跃的会话排在前面
+        # - select：只取列表渲染所需字段，避免 metadata/config 等无用字段占用带宽
+        response = _http.post(
+            f"{LANGGRAPH_API_URL}/threads/search",
+            json={
+                "limit": SESSION_LIST_LIMIT,
+                "sort_by": "updated_at",
+                "sort_order": "desc",
+                "select": ["thread_id", "created_at", "updated_at"],
+            },
+            timeout=10,
+        )
 
         if response.status_code != 200:
             logger.error("获取线程列表失败: %s", response.status_code)
@@ -377,7 +412,7 @@ def fetch_sessions_list() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]
 def fetch_session_detail(session_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """获取单个线程详情 + 对话历史。成功返回 (payload, None)。"""
     try:
-        response = requests.get(f"{LANGGRAPH_API_URL}/threads/{session_id}")
+        response = _http.get(f"{LANGGRAPH_API_URL}/threads/{session_id}", timeout=10)
 
         if response.status_code != 200:
             logger.error("获取线程详情失败: %s", response.status_code)
@@ -387,7 +422,7 @@ def fetch_session_detail(session_id: str) -> Tuple[Optional[Dict[str, Any]], Opt
         conversation_history: List[Dict[str, Any]] = []
 
         try:
-            state_response = requests.get(
+            state_response = _http.get(
                 f"{LANGGRAPH_API_URL}/threads/{session_id}/state",
                 timeout=5
             )
@@ -413,7 +448,7 @@ def fetch_session_detail(session_id: str) -> Tuple[Optional[Dict[str, Any]], Opt
 
 def delete_remote_thread(thread_id: str) -> Tuple[bool, int]:
     """删除 LangGraph 线程。成功为任意 2xx（DELETE 常为 204 No Content）。"""
-    response = requests.delete(f"{LANGGRAPH_API_URL}/threads/{thread_id}", timeout=10)
+    response = _http.delete(f"{LANGGRAPH_API_URL}/threads/{thread_id}", timeout=10)
     ok = 200 <= response.status_code < 300
     return ok, response.status_code
 
@@ -427,7 +462,7 @@ def clear_thread_and_create_new(thread_id: str) -> Tuple[Optional[str], Optional
     if not ok:
         return None, f'清空会话失败: {status}'
 
-    new_thread_response = requests.post(
+    new_thread_response = _http.post(
         f"{LANGGRAPH_API_URL}/threads",
         json={},
         timeout=10
@@ -479,13 +514,14 @@ def run_chat_sync(
         "customer_query": user_message.strip(),
         "session_id": thread_id
     }
-    if images:
-        run_input["customer_images"] = images
+    # 无条件写入该键（无图时为 None）：run input 缺失的键会保留 checkpointer 旧值，
+    # 否则上一轮的图片会残留到本轮，被 _build_human_message 误附给 LLM
+    run_input["customer_images"] = images
 
-    logger.info("run_input customer_query=%r session_id=%s", user_message.strip()[:80], thread_id)
+    logger.debug("run_input customer_query=%r session_id=%s", user_message.strip()[:80], thread_id)
 
     try:
-        run_resp = requests.post(
+        run_resp = _http.post(
             f"{LANGGRAPH_API_URL}/threads/{thread_id}/runs",
             json={
                 "assistant_id": assistant_id,
@@ -511,19 +547,19 @@ def run_chat_sync(
                 return None, '运行超时', 500, thread_id
 
             time.sleep(0.5)
-            status_response = requests.get(
+            status_response = _http.get(
                 f"{LANGGRAPH_API_URL}/threads/{thread_id}/runs/{run_id}",
                 timeout=10
             )
             if status_response.status_code != 200:
                 logger.error("获取运行状态失败: %s", status_response.status_code)
-                break
+                return None, f'获取运行状态失败: {status_response.status_code}', 500, thread_id
 
             run_data = status_response.json()
             run_status = run_data.get("status", "unknown")
 
             if run_status in ["completed", "success"]:
-                thread_response = requests.get(
+                thread_response = _http.get(
                     f"{LANGGRAPH_API_URL}/threads/{thread_id}/state",
                     timeout=10
                 )
@@ -644,8 +680,8 @@ def stream_chat_events(
         "customer_query": user_message.strip(),
         "session_id": thread_id
     }
-    if images:
-        stream_run_input["customer_images"] = images
+    # 同 run_chat_sync：无图时也写 None 覆盖 checkpointer 中的旧图片，防止跨轮残留
+    stream_run_input["customer_images"] = images
 
     sid = thread_id
     streamed_any = False
@@ -657,7 +693,7 @@ def stream_chat_events(
     final_query_type = ""
 
     try:
-        response = requests.post(
+        response = _http.post(
             f"{LANGGRAPH_API_URL}/threads/{sid}/runs/stream",
             json={
                 "assistant_id": assistant_id,
@@ -797,7 +833,7 @@ def _stream_chat_events_by_polling(
     yield _sse({"type": "status", "content": "正在切换兼容模式处理…"})
 
     try:
-        response = requests.post(
+        response = _http.post(
             f"{LANGGRAPH_API_URL}/threads/{tid}/runs",
             json={"assistant_id": assistant_id, "input": run_input},
             timeout=30,
@@ -825,7 +861,7 @@ def _stream_chat_events_by_polling(
                 return
 
             time.sleep(0.5)
-            status_response = requests.get(
+            status_response = _http.get(
                 f"{LANGGRAPH_API_URL}/threads/{tid}/runs/{run_id}",
                 timeout=10
             )
@@ -836,7 +872,7 @@ def _stream_chat_events_by_polling(
             run_status = status_response.json().get("status", "unknown")
 
             if run_status in ["completed", "success"]:
-                thread_response = requests.get(
+                thread_response = _http.get(
                     f"{LANGGRAPH_API_URL}/threads/{tid}/state",
                     timeout=10
                 )
@@ -875,13 +911,13 @@ def langgraph_connectivity_test() -> Tuple[Optional[Dict[str, Any]], Optional[st
     try:
         health_check_status = 0
         try:
-            ok_response = requests.get(f"{LANGGRAPH_API_URL}/ok", timeout=5)
+            ok_response = _http.get(f"{LANGGRAPH_API_URL}/ok", timeout=5)
             health_check_status = ok_response.status_code
         except requests.exceptions.RequestException as e:
             logger.warning("LangGraph GET /ok 失败: %s", e)
 
-        threads_response = requests.post(f"{LANGGRAPH_API_URL}/threads/search", json={}, timeout=10)
-        assistants_response = requests.post(f"{LANGGRAPH_API_URL}/assistants/search", json={}, timeout=10)
+        threads_response = _http.post(f"{LANGGRAPH_API_URL}/threads/search", json={}, timeout=10)
+        assistants_response = _http.post(f"{LANGGRAPH_API_URL}/assistants/search", json={}, timeout=10)
 
         if not (200 <= health_check_status < 300) and (200 <= threads_response.status_code < 300):
             logger.warning("LangGraph GET /ok 未成功，但 threads/search 正常，健康检查标记为通过")

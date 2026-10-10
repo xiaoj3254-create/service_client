@@ -117,7 +117,7 @@ def classify_query(query: str, llm=None) -> str:
         response = llm.invoke(messages)
         result = (getattr(response, "content", "") or "").strip()
         normalized = normalize_classifier_label(result)
-        logger.info("classify_query 输入=%r 原始输出=%r 规范化=%s", query[:60], result[:120], normalized)
+        logger.debug("classify_query 输入=%r 原始输出=%r 规范化=%s", query[:60], result[:120], normalized)
         return normalized
     except Exception as e:
         logger.warning("classify_query 出错，保守兜底: %s", e)

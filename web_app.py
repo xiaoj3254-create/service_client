@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, render_template, request, jsonify, session, Response
+from werkzeug.exceptions import HTTPException
 
 from chat_web_service import (
     run_chat_sync,
@@ -50,6 +51,25 @@ app.config['SESSION_TYPE'] = 'filesystem'
 # 客户图片限制：base64 解码后单张最大 5MB，最多 4 张
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_COUNT = 4
+
+# 单条用户消息最大长度（字符）。超长输入会显著增加分类/回答的 token 成本与延迟。
+MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "2000"))
+
+# 请求体总大小上限。图片校验发生在解析之后，若不设此上限，攻击者可发送超大
+# JSON 在解析阶段耗尽内存。4 张 5MB 图片 base64 后约 4×6.7MB≈27MB，再留 JSON 余量。
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv("MAX_CONTENT_LENGTH_MB", "32")) * 1024 * 1024
+
+
+@app.errorhandler(413)
+def request_entity_too_large(_err):
+    return jsonify({'error': '请求体过大，请减少图片数量或压缩图片后重试'}), 413
+
+
+def _validate_query_length(user_message: str) -> Optional[str]:
+    """校验用户消息长度；合法返回 None，超长返回错误信息。"""
+    if len(user_message) > MAX_QUERY_CHARS:
+        return f'消息过长，请控制在 {MAX_QUERY_CHARS} 字以内'
+    return None
 
 
 def _validate_single_image(image: str) -> Tuple[Optional[str], Optional[str]]:
@@ -142,6 +162,10 @@ def chat():
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
 
+        query_err = _validate_query_length(user_message)
+        if query_err:
+            return jsonify({'error': query_err}), 400
+
         image_data, img_err = validate_image_data(data.get('images'))
         if img_err:
             return jsonify({'error': img_err}), 400
@@ -157,6 +181,9 @@ def chat():
             'session_id': thread_id,
             'thread_id': thread_id,
         })
+    except HTTPException:
+        # 保留 Flask/werkzeug 的 HTTP 语义（如 413 请求体过大），不要被吞成 500
+        raise
     except Exception as e:
         logger.exception("聊天处理错误")
         return jsonify({'error': '服务器内部错误，请稍后重试'}), 500
@@ -169,6 +196,10 @@ def chat_stream():
         data = request.get_json()
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
+
+        query_err = _validate_query_length(user_message)
+        if query_err:
+            return jsonify({'error': query_err}), 400
 
         image_data, img_err = validate_image_data(data.get('images'))
         if img_err:
@@ -185,6 +216,9 @@ def chat_stream():
             }
         )
 
+    except HTTPException:
+        # 保留 Flask/werkzeug 的 HTTP 语义（如 413 请求体过大），不要被吞成 500
+        raise
     except Exception as e:
         logger.exception("流式聊天处理错误")
         return jsonify({'error': '服务器内部错误，请稍后重试'}), 500

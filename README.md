@@ -126,6 +126,9 @@ cp env_example.txt .env
 | `FLASK_SECRET_KEY` | Flask session 密钥（生产必填强随机值） | 未设置时自动生成临时随机值 |
 | `LANGGRAPH_API_URL` | LangGraph API 地址 | `http://127.0.0.1:2024` |
 | `LANGGRAPH_GRAPH_NAME` | 图名 | `customer_service` |
+| `MAX_QUERY_CHARS` | 单条消息最大字符数（超出返回 400） | `2000` |
+| `MAX_CONTENT_LENGTH_MB` | 请求体大小上限（MB） | `32` |
+| `SESSION_LIST_LIMIT` | 会话列表一次拉取的最大线程数 | `30` |
 
 ### 3. 启动服务
 

@@ -18,9 +18,16 @@ FLASK_PORT=5000
 FLASK_DEBUG=False
 FLASK_SECRET_KEY=your-secret-key-here
 
+# 单条消息最大字符数（超出返回 400）
+MAX_QUERY_CHARS=2000
+# 请求体总大小上限（MB），需容纳最多 4 张 5MB 图片的 base64
+MAX_CONTENT_LENGTH_MB=32
+
 # LangGraph HTTP API (see chat_web_service.py)
 # LANGGRAPH_API_URL=http://127.0.0.1:2024
 # LANGGRAPH_GRAPH_NAME=customer_service
+# 会话列表一次拉取的最大线程数（服务端默认仅 10）
+# SESSION_LIST_LIMIT=30
 
 # ===== Notes =====
 

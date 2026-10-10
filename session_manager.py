@@ -16,22 +16,26 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
 logger = logging.getLogger(__name__)
 
-# 存储后端导入
-from langchain_community.chat_message_histories import (
-    RedisChatMessageHistory,
-    PostgresChatMessageHistory,
-    FileChatMessageHistory
-)
+# 非内存存储后端（redis / postgres / file / mongodb）依赖各自的第三方包，
+# 均属可选能力：默认的 memory 后端不依赖它们。为免未安装可选包就阻断整个模块导入，
+# 统一推迟到 _create_chat_history 真正选用对应后端时再导入。
 
-# MongoDB 后端在新版 langchain-community 中已迁移至独立的 langchain-mongodb 包，
-# 属于可选后端，缺失时不影响默认的 memory/redis/postgres/file 后端使用。
-try:
-    from langchain_community.chat_message_histories import MongoDBChatMessageHistory
-except ImportError:
+
+def _load_mongodb_history_class():
+    """加载 MongoDB 对话历史类（新版 langchain-community 已迁出为 langchain-mongodb 包）。"""
+    try:
+        from langchain_community.chat_message_histories import MongoDBChatMessageHistory
+        return MongoDBChatMessageHistory
+    except ImportError:
+        pass
     try:
         from langchain_mongodb import MongoDBChatMessageHistory
-    except ImportError:
-        MongoDBChatMessageHistory = None
+        return MongoDBChatMessageHistory
+    except ImportError as e:
+        raise ImportError(
+            "MongoDB 后端需要安装 langchain-mongodb 包：pip install langchain-mongodb"
+        ) from e
+
 
 class LangChainSessionManager:
     """
@@ -86,28 +90,28 @@ class LangChainSessionManager:
             return InMemoryChatMessageHistory()
 
         if self.storage_backend == "redis":
+            from langchain_community.chat_message_histories import RedisChatMessageHistory
             return RedisChatMessageHistory(
                 session_id=session_id,
                 url=self.storage_config["url"],
             )
 
         if self.storage_backend == "mongodb":
-            if MongoDBChatMessageHistory is None:
-                raise ImportError(
-                    "MongoDB 后端需要安装 langchain-mongodb 包：pip install langchain-mongodb"
-                )
+            MongoDBChatMessageHistory = _load_mongodb_history_class()
             return MongoDBChatMessageHistory(
                 session_id=session_id,
                 connection_string=self.storage_config["connection_string"],
             )
 
         if self.storage_backend == "postgres":
+            from langchain_community.chat_message_histories import PostgresChatMessageHistory
             return PostgresChatMessageHistory(
                 session_id=session_id,
                 connection_string=self.storage_config["connection_string"],
             )
 
         if self.storage_backend == "file":
+            from langchain_community.chat_message_histories import FileChatMessageHistory
             file_path = os.path.join(
                 self.storage_config["storage_dir"],
                 f"{session_id}.json",
