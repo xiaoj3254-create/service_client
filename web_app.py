@@ -10,6 +10,7 @@ import binascii
 import logging
 import secrets
 import time
+import uuid
 from typing import Dict, Any, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -27,6 +28,7 @@ from chat_web_service import (
     delete_remote_thread,
     clear_thread_and_create_new,
     langgraph_connectivity_test,
+    OWNERSHIP_ERROR,
 )
 
 # 导入配置（与历史行为保持一致）
@@ -129,6 +131,27 @@ def validate_image_data(image: Any) -> Tuple[Optional[List[str]], Optional[str]]
     return validated, None
 
 
+# --- 用户身份与会话归属 ---
+
+def get_or_create_user_id() -> str:
+    """
+    获取当前浏览器访客的用户标识（匿名身份，持久化在 Flask session cookie 中）。
+
+    所有 LangGraph 线程创建时都会写入 metadata.user_id，会话列表 / 详情 / 删除
+    均按该标识做归属校验，保证不同访客之间的会话相互隔离、互不可见。
+    """
+    user_id = session.get('user_id')
+    if not user_id:
+        user_id = uuid.uuid4().hex
+        session['user_id'] = user_id
+    return user_id
+
+
+def _ownership_status(err: Optional[str]) -> bool:
+    """判断错误是否为会话归属校验失败（用于返回 403 而非 500）。"""
+    return err == OWNERSHIP_ERROR
+
+
 # --- Flask session 内的本地对话占位（主页模板可能使用）---
 
 def get_conversation_history(session_id: str) -> List[Dict[str, Any]]:
@@ -158,9 +181,10 @@ def index():
 def chat():
     """处理聊天请求"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
+        user_id = get_or_create_user_id()
 
         query_err = _validate_query_length(user_message)
         if query_err:
@@ -171,7 +195,7 @@ def chat():
             return jsonify({'error': img_err}), 400
 
         ai_text, err_msg, http_code, thread_id = run_chat_sync(
-            user_message, client_session_id, images=image_data
+            user_message, client_session_id, images=image_data, user_id=user_id
         )
         if err_msg:
             return jsonify({'error': err_msg}), http_code or 500
@@ -193,9 +217,10 @@ def chat():
 def chat_stream():
     """处理流式聊天请求"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         user_message = (data.get('message') or '').strip()
         client_session_id = data.get('session_id', 'default')
+        user_id = get_or_create_user_id()
 
         query_err = _validate_query_length(user_message)
         if query_err:
@@ -206,7 +231,7 @@ def chat_stream():
             return jsonify({'error': img_err}), 400
 
         return Response(
-            stream_chat_events(user_message, client_session_id, images=image_data),
+            stream_chat_events(user_message, client_session_id, images=image_data, user_id=user_id),
             mimetype='text/event-stream',
             headers={
                 # 反缓冲：本地 Flask 直连本就不缓冲，但 nginx/网关默认会缓冲整个响应，
@@ -226,8 +251,8 @@ def chat_stream():
 
 @app.route('/api/sessions', methods=['GET'])
 def get_sessions():
-    """获取会话列表"""
-    sessions, err = fetch_sessions_list()
+    """获取会话列表（仅当前用户的会话）"""
+    sessions, err = fetch_sessions_list(get_or_create_user_id())
     if err:
         return jsonify({'error': err}), 500
     return jsonify({'sessions': sessions or []})
@@ -235,22 +260,24 @@ def get_sessions():
 
 @app.route('/api/sessions/<session_id>', methods=['GET'])
 def get_session(session_id):
-    """获取特定会话详情"""
-    session_data, err = fetch_session_detail(session_id)
+    """获取特定会话详情（仅当前用户名下的会话）"""
+    session_data, err = fetch_session_detail(session_id, get_or_create_user_id())
     if err:
-        return jsonify({'error': err}), 500
+        return jsonify({'error': err}), (403 if _ownership_status(err) else 500)
     return jsonify({'session': session_data})
 
 
 @app.route('/api/sessions/<session_id>', methods=['DELETE'])
 def delete_session(session_id):
-    """删除会话"""
+    """删除会话（仅当前用户名下的会话）"""
     try:
-        ok, status = delete_remote_thread(session_id)
+        ok, status = delete_remote_thread(session_id, get_or_create_user_id())
         if ok:
             if 'conversations' in session and session_id in session['conversations']:
                 del session['conversations'][session_id]
             return jsonify({'message': '会话删除成功'})
+        if status == 403:
+            return jsonify({'error': OWNERSHIP_ERROR}), 403
         return jsonify({'error': f'删除会话失败: {status}'}), 500
     except Exception as e:
         logger.exception("删除会话时出错")
@@ -259,11 +286,11 @@ def delete_session(session_id):
 
 @app.route('/api/sessions/<session_id>/clear', methods=['POST'])
 def clear_session(session_id):
-    """清空会话"""
+    """清空会话（仅当前用户名下的会话）"""
     try:
-        new_thread_id, err = clear_thread_and_create_new(session_id)
+        new_thread_id, err = clear_thread_and_create_new(session_id, get_or_create_user_id())
         if err:
-            return jsonify({'error': err}), 500
+            return jsonify({'error': err}), (403 if _ownership_status(err) else 500)
 
         if 'conversations' in session and session_id in session['conversations']:
             session['conversations'][session_id] = []
@@ -281,7 +308,6 @@ def clear_session(session_id):
 def create_new_session():
     """创建新会话（Flask session 侧）"""
     try:
-        import uuid
         new_session_id = str(uuid.uuid4())
         session['current_session_id'] = new_session_id
         if 'conversations' not in session:

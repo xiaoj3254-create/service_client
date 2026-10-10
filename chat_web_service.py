@@ -54,6 +54,9 @@ _http.mount("https://", _http_adapter)
 # 助手ID缓存（创建后只读，可安全跨请求复用）
 _assistant_id: Optional[str] = None
 
+# 会话归属校验失败时的统一错误文案（不区分「不存在」与「无权」，避免泄露线程存在性）
+OWNERSHIP_ERROR: str = '会话不存在或无权访问'
+
 # 注意：_current_thread_id 全局变量已移除，避免多用户并发时线程ID互相覆盖。
 # 线程ID现在由 ensure_thread_exists 返回，作为局部变量在请求生命周期内传递。
 
@@ -198,6 +201,30 @@ def extract_ai_response(thread_state: Dict[str, Any]) -> str:
         return "抱歉，处理您的请求时出现了错误。"
 
 
+def fetch_final_response_from_state(thread_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    run 已在服务端执行完毕后，直接从线程 state 读取最终回复。
+
+    用于流式通道零输出但流已正常结束的场景：此时 run 已完成、结果就在 state 里，
+    再提交一个 run 会重复排队、重复回答。仅应在「流正常结束」后调用；
+    流式中途异常（超时/断连）时 run 可能尚未完成，读到的会是上一轮的旧回复，不可用此函数。
+    成功返回 (回复文本, None)，失败返回 (None, error_message)。
+    """
+    try:
+        response = _http.get(
+            f"{LANGGRAPH_API_URL}/threads/{thread_id}/state",
+            timeout=10
+        )
+        if response.status_code != 200:
+            logger.error("获取线程状态失败: %s", response.status_code)
+            return None, f'获取会话状态失败: {response.status_code}'
+        text = extract_ai_response(response.json())
+        return (text or None), None
+    except Exception:
+        logger.exception("读取线程状态时出错")
+        return None, '获取会话状态失败'
+
+
 # -----------------------------------------------------------------------------
 # 助手 / 线程
 # -----------------------------------------------------------------------------
@@ -251,39 +278,53 @@ def ensure_assistant_exists() -> Tuple[bool, Optional[str]]:
         return False, None
 
 
-def ensure_thread_exists(client_session_id: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+def _thread_owned_by(thread_id: str, user_id: str) -> bool:
     """
-    确保有可用的 LangGraph 线程。
-    - client_session_id 是已存在的合法线程 ID：复用该线程（继续/切换历史会话）。
-    - client_session_id 为空、'default' 或非法：一律【新建】线程，
-      不复用全局缓存，保证每次"新建对话"相互隔离。
+    校验线程存在且 metadata.user_id 与当前用户一致。
+
+    无归属信息的旧线程（本功能上线前创建）一律视为不可用（保守策略），
+    复用或展示它们会把他人会话泄露给当前用户。
+    """
+    try:
+        response = _http.get(
+            f"{LANGGRAPH_API_URL}/threads/{thread_id}",
+            timeout=5
+        )
+        if response.status_code != 200:
+            return False
+        metadata = (response.json() or {}).get("metadata") or {}
+        return isinstance(metadata, dict) and metadata.get("user_id") == user_id
+    except Exception as e:
+        logger.warning("校验线程 %s 归属时出错: %s", thread_id, e)
+        return False
+
+
+def ensure_thread_exists(client_session_id: Optional[str], user_id: str) -> Tuple[bool, Optional[str]]:
+    """
+    确保有可用的 LangGraph 线程，并按用户隔离。
+    - client_session_id 是当前用户名下已存在的合法线程：复用该线程（继续/切换历史会话）。
+    - client_session_id 为空、'default'、线程不存在、或归属其他用户：一律【新建】线程，
+      不复用、绝不透传他人线程，保证会话按用户隔离。
+    所有新建线程都会写入 metadata.user_id，供会话列表过滤与归属校验。
     返回 (成功标志, thread_id)。
     """
     sid = client_session_id
+    if sid and sid != 'default' and _thread_owned_by(sid, user_id):
+        return True, sid
     if sid and sid != 'default':
-        try:
-            thread_response = _http.get(
-                f"{LANGGRAPH_API_URL}/threads/{sid}",
-                timeout=5
-            )
-            if thread_response.status_code == 200:
-                return True, sid
-            else:
-                logger.warning("会话ID %s 不是有效的LangGraph线程ID，将创建新线程", sid)
-        except Exception as e:
-            logger.warning("验证会话ID %s 时出错: %s，将创建新线程", sid, e)
+        logger.warning("会话ID %s 不是当前用户的有效线程，将创建新线程", sid)
 
     try:
         response = _http.post(
             f"{LANGGRAPH_API_URL}/threads",
-            json={},
+            json={"metadata": {"user_id": user_id}},
             timeout=10
         )
 
         if response.status_code == 200:
             result = response.json()
             thread_id = result["thread_id"]
-            logger.info("创建新线程: %s", thread_id)
+            logger.info("创建新线程: %s (user_id=%s)", thread_id, user_id)
             return True, thread_id
         else:
             logger.error("创建线程失败: %s", response.status_code)
@@ -352,20 +393,22 @@ def _fetch_thread_state_info(thread_id: str) -> Tuple[int, str, str]:
     return message_count, last_user_question, search_text
 
 
-def fetch_sessions_list() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+def fetch_sessions_list(user_id: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     """
-    拉取线程列表并拼装前端会话项。
+    拉取当前用户的线程列表并拼装前端会话项。
     成功返回 (sessions, None)，失败返回 (None, error_message)。
     """
     try:
         # 显式指定 limit / 排序 / 字段：
         # - limit：不传时服务端默认仅返回 10 条，会隐式截断历史会话（同时把 N+1 拉取限定在上限内）
+        # - metadata：只返回当前用户名下的线程（user_id 隔离，绝不泄露他人会话）
         # - sort_by=updated_at desc：最近活跃的会话排在前面
         # - select：只取列表渲染所需字段，避免 metadata/config 等无用字段占用带宽
         response = _http.post(
             f"{LANGGRAPH_API_URL}/threads/search",
             json={
                 "limit": SESSION_LIST_LIMIT,
+                "metadata": {"user_id": user_id},
                 "sort_by": "updated_at",
                 "sort_order": "desc",
                 "select": ["thread_id", "created_at", "updated_at"],
@@ -409,9 +452,13 @@ def fetch_sessions_list() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]
         return None, f'服务器错误: {str(e)}'
 
 
-def fetch_session_detail(session_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """获取单个线程详情 + 对话历史。成功返回 (payload, None)。"""
+def fetch_session_detail(session_id: str, user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """获取当前用户的单个线程详情 + 对话历史。成功返回 (payload, None)。"""
     try:
+        if not _thread_owned_by(session_id, user_id):
+            logger.warning("拒绝访问不属于当前用户的会话 %s", session_id)
+            return None, OWNERSHIP_ERROR
+
         response = _http.get(f"{LANGGRAPH_API_URL}/threads/{session_id}", timeout=10)
 
         if response.status_code != 200:
@@ -446,25 +493,30 @@ def fetch_session_detail(session_id: str) -> Tuple[Optional[Dict[str, Any]], Opt
         return None, f'服务器错误: {str(e)}'
 
 
-def delete_remote_thread(thread_id: str) -> Tuple[bool, int]:
-    """删除 LangGraph 线程。成功为任意 2xx（DELETE 常为 204 No Content）。"""
+def delete_remote_thread(thread_id: str, user_id: str) -> Tuple[bool, int]:
+    """删除当前用户的 LangGraph 线程。越权时返回 (False, 403)。"""
+    if not _thread_owned_by(thread_id, user_id):
+        logger.warning("拒绝删除不属于当前用户的会话 %s", thread_id)
+        return False, 403
     response = _http.delete(f"{LANGGRAPH_API_URL}/threads/{thread_id}", timeout=10)
     ok = 200 <= response.status_code < 300
     return ok, response.status_code
 
 
-def clear_thread_and_create_new(thread_id: str) -> Tuple[Optional[str], Optional[str]]:
+def clear_thread_and_create_new(thread_id: str, user_id: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    删除旧线程并在服务端新建线程。
-    成功返回 (new_thread_id, None)，失败返回 (None, error)。
+    删除当前用户的旧线程并在服务端新建线程。
+    越权时返回 (None, OWNERSHIP_ERROR)；成功返回 (new_thread_id, None)。
     """
-    ok, status = delete_remote_thread(thread_id)
+    ok, status = delete_remote_thread(thread_id, user_id)
     if not ok:
+        if status == 403:
+            return None, OWNERSHIP_ERROR
         return None, f'清空会话失败: {status}'
 
     new_thread_response = _http.post(
         f"{LANGGRAPH_API_URL}/threads",
-        json={},
+        json={"metadata": {"user_id": user_id}},
         timeout=10
     )
 
@@ -483,21 +535,25 @@ def run_chat_sync(
     user_message: str,
     client_session_id: Optional[str] = None,
     images: Optional[List[str]] = None,
+    user_id: str = "",
 ) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
     """
     在当前线程上提交一轮用户消息并等待完成。
     client_session_id: 前端传入的会话 ID（可为 LangGraph 线程 ID）。
     images: 可选的客户图片 data URL 列表（"data:image/...;base64,..."），随输入传给工作流。
+    user_id: 当前用户标识，用于线程归属校验与新建线程的 metadata。
     返回 (ai_text, error_text, http_status_optional, thread_id)。
     """
     if not user_message.strip():
         return None, '消息不能为空', 400, None
+    if not user_id:
+        return None, OWNERSHIP_ERROR, 403, None
 
     asst_ok, assistant_id = ensure_assistant_exists()
     if not asst_ok:
         return None, '无法创建或找到助手', 500, None
 
-    thread_ok, thread_id = ensure_thread_exists(client_session_id)
+    thread_ok, thread_id = ensure_thread_exists(client_session_id, user_id)
     if not thread_ok:
         return None, '无法创建线程', 500, None
 
@@ -631,9 +687,12 @@ def stream_chat_events(
     user_message: str,
     client_session_id: Optional[str] = None,
     images: Optional[List[str]] = None,
+    user_id: str = "",
 ) -> Iterable[str]:
     """
     以 SSE 转发 LangGraph 的流式运行结果，实现真正的逐 token 推流。
+
+    user_id: 当前用户标识，用于线程归属校验与新建线程的 metadata。
 
     走 POST /threads/{tid}/runs/stream，stream_mode 取：
     - "custom" ：graph 节点内用 get_stream_writer() 写入的 token 片段
@@ -646,11 +705,17 @@ def stream_chat_events(
     - {"error": "..."}                                    错误
     - data: [DONE]                                        流结束标记
 
-    健壮性：/runs/stream 不可用、或一个 token 都没收到时，自动退回
-    _stream_chat_events_by_polling（原轮询实现），保证行为不退化。
+    健壮性：/runs/stream 不可用、或提交阶段失败时，自动退回
+    _stream_chat_events_by_polling（原轮询实现）；run 已执行完毕但流式通道零输出时，
+    直接读取线程 state 取最终回复，绝不重跑图（避免重复排队与重复回答）。
     """
     if not user_message.strip():
         yield _sse({'error': '消息不能为空'})
+        yield "data: [DONE]\n\n"
+        return
+
+    if not user_id:
+        yield _sse({'error': OWNERSHIP_ERROR})
         yield "data: [DONE]\n\n"
         return
 
@@ -666,7 +731,7 @@ def stream_chat_events(
         yield "data: [DONE]\n\n"
         return
 
-    thread_ok, thread_id = ensure_thread_exists(client_session_id)
+    thread_ok, thread_id = ensure_thread_exists(client_session_id, user_id)
     if not thread_ok:
         yield _sse({'error': '无法创建线程'})
         yield "data: [DONE]\n\n"
@@ -797,13 +862,21 @@ def stream_chat_events(
     full_text = "".join(accumulated)
     if not full_text:
         if not fallback_text:
-            # 既无 token 也无最终文本：退回轮询实现再取一次完整回复
-            logger.warning("流式通道无任何输出，回退到轮询式实现")
-            yield from _stream_chat_events_by_polling(user_message, sid, assistant_id, stream_run_input)
-            return
-        # 有完整文本但没有流式片段（例：LLM 走了非流式回退）：整段补发一次
-        full_text = fallback_text
-        yield _sse({"type": "token", "content": full_text})
+            # 流已正常结束但零输出：run 已在服务端执行完毕，结果就在线程 state 里，
+            # 直接读取，绝不重跑（重跑会再排一个 run、并让客户收到两份回答）
+            logger.warning("流式通道无任何输出，直接读取线程 state 取最终回复")
+            state_text, state_err = fetch_final_response_from_state(sid)
+            if state_text:
+                full_text = state_text
+                yield _sse({"type": "token", "content": full_text})
+            else:
+                yield _sse({'error': state_err or '客服暂时没有生成回复，请稍后重试'})
+                yield "data: [DONE]\n\n"
+                return
+        else:
+            # 有完整文本但没有流式片段（例：LLM 走了非流式回退）：整段补发一次
+            full_text = fallback_text
+            yield _sse({"type": "token", "content": full_text})
 
     yield _sse({
         "type": "done",
