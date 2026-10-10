@@ -6,6 +6,8 @@
 from .base_agent import BaseAgent
 
 class BillingAgent(BaseAgent):
+    domain = "billing"  # RAG 领域标识（knowledge/billing/）
+
     def __init__(self):
         super().__init__(
             name="账单专家",

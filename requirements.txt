@@ -1,15 +1,14 @@
 # 核心运行时依赖
 langchain-core>=1.3.0
 langgraph>=1.0.0
+langchain-openai>=0.3
 python-dotenv>=1.0.0
 requests>=2.31.0
 pydantic>=2.7.4
 flask>=2.3.0
 
-# 可选：非内存会话存储后端。
-# 默认使用 memory 后端（仅依赖 langchain-core），无需安装下列任一包；
-# 仅当 session_manager 选用对应后端时按需安装：
-#   langchain-community   # file / redis / postgres 后端
-#   redis                 # redis 后端
-#   psycopg2-binary       # postgres 后端
-#   langchain-mongodb     # mongodb 后端（含 pymongo 依赖）
+# 测试（开发用）：pip install pytest
+# pytest>=8.0
+
+# 可选：RAG 知识库（见 tools/rag_tools.py 与 scripts/build_knowledge_base.py）
+# langchain-chroma>=0.2

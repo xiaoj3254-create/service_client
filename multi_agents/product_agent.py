@@ -7,6 +7,8 @@ from typing import Dict, Any
 from .base_agent import BaseAgent
 
 class ProductAgent(BaseAgent):
+    domain = "product"  # RAG 领域标识（knowledge/product/）
+
     def __init__(self):
         super().__init__(
             name="产品专家",

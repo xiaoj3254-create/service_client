@@ -14,13 +14,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "Qwen/Qwen3-8B")
 
-# HTTP请求配置
+# HTTP请求配置（由 ChatOpenAI 客户端使用）
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))
-HTTP_HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "MultiAgentCustomerService/1.0.0"
-}
 
 # 系统配置
 SYSTEM_NAME = "多智能体客服系统"

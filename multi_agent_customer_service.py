@@ -5,20 +5,13 @@
 支持多轮对话和会话管理
 """
 
-import os
-import json
 import logging
-import requests
-import time
-from typing import Dict, List, Any, Optional, TypedDict, Annotated
+from typing import Dict, List, Any, Optional, TypedDict
 from datetime import datetime
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
 from langgraph.config import get_config
-from langchain_core.tools import tool
-from pydantic import BaseModel
 
 # 加载环境变量
 load_dotenv()
@@ -34,9 +27,6 @@ from multi_agents import (
     ComplaintAgent, GeneralAgent
 )
 from tools import classify_query
-
-# 导入会话管理器
-from session_manager import LangChainSessionManager, default_session_manager
 
 # 超出客服范围时的固定回复（护栏：不调用业务智能体）
 OUT_OF_SCOPE_REPLY = (
@@ -55,213 +45,38 @@ class AgentState(TypedDict):
     tools_used: List[str]
     next_agent: str
     conversation_history: List[Any]
-    memory: Optional[BaseChatMessageHistory]
-    # 由图 checkpointer 持久化，跨 LangGraph 工作进程仍可续聊（内存 session_manager 无法做到）
+    # 由图 checkpointer 持久化，跨 LangGraph 工作进程仍可续聊
     persisted_dialogue: List[Any]
     # 客户上传的图片列表（data URL，如 "data:image/jpeg;base64,..."）；无图时为 None
     customer_images: Optional[List[str]]
 
-# 流式请求的连接超时（秒）：与整体读取超时分开，避免长回复被总超时误杀
-HTTP_CONNECT_TIMEOUT = int(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
-
-# OpenAI兼容API客户端类
-class OpenAICompatibleClient:
-    def __init__(self, api_key: str, base_url: str, model: str):
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
-        self.model = model
-        self.timeout = HTTP_TIMEOUT
-        self.max_retries = HTTP_MAX_RETRIES
-        self.headers = HTTP_HEADERS.copy()
-        self.headers["Authorization"] = f"Bearer {api_key}"
-
-        # 添加LangChain回调管理器所需的属性
-        self.parent_run_id = None
-        self.run_id = None
-        self.tags = []
-        self.metadata = {}
-        self.handlers = []
-        self.callback_manager = None
-        self.inheritable_handlers = []
-        self.inheritable_tags = []
-        self.inheritable_metadata = {}
-
-    def _format_messages(self, messages) -> List[Dict[str, Any]]:
-        """把 LangChain 消息对象 / 纯字符串统一转成 OpenAI 兼容的 messages 列表。
-
-        注意：msg.content 为 list 时是多模态消息（含 image_url 片段），
-        结构本身即 OpenAI 兼容协议格式（mimo-v2.5 图片理解），需原样透传不可转字符串。
-        """
-        formatted_messages = []
-        for msg in messages:
-            if hasattr(msg, 'content'):
-                # 处理LangChain消息对象
-                if hasattr(msg, 'type'):
-                    if msg.type == 'human':
-                        formatted_messages.append({"role": "user", "content": msg.content})
-                    elif msg.type == 'ai':
-                        formatted_messages.append({"role": "assistant", "content": msg.content})
-                    elif msg.type == 'system':
-                        # 系统消息转换为用户消息
-                        formatted_messages.append({"role": "user", "content": f"System instruction: {msg.content}"})
-                    else:
-                        formatted_messages.append({"role": "user", "content": msg.content})
-                else:
-                    # 默认作为用户消息处理
-                    formatted_messages.append({"role": "user", "content": msg.content})
-            else:
-                # 处理字符串或其他类型
-                formatted_messages.append({"role": "user", "content": str(msg)})
-        return formatted_messages
-
-    def _build_payload(self, messages, stream: bool = False) -> Dict[str, Any]:
-        """构造 chat/completions 请求体；stream=False 时不带 stream 字段，保持对旧网关的兼容。"""
-        formatted_messages = self._format_messages(messages)
-
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "messages": formatted_messages,
-        }
-        if stream:
-            payload["stream"] = True
-
-        # 调试日志：仅记录消息数量与角色分布，不打印消息正文（避免泄露用户隐私）
-        role_counts = {}
-        for m in formatted_messages:
-            r = m.get("role", "unknown")
-            role_counts[r] = role_counts.get(r, 0) + 1
-        logger.debug("API request: model=%s, messages=%d, roles=%s", self.model, len(formatted_messages), role_counts)
-        return payload
-
-    def invoke(self, messages):
-        """调用OpenAI兼容API（非流式）"""
-        payload = self._build_payload(messages)
-
-        # 重试机制
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.post(
-                    f"{self.base_url}/chat/completions",
-                    json=payload,
-                    headers=self.headers,
-                    timeout=self.timeout
-                )
-
-                response.raise_for_status()
-                result = response.json()
-
-                # 提取响应内容
-                if "choices" in result and len(result["choices"]) > 0:
-                    message = result["choices"][0].get("message", {})
-                    content = message.get("content", "")
-                    return CustomResponse(content)
-                else:
-                    return CustomResponse("API response format error")
-
-            except requests.exceptions.RequestException as e:
-                logger.warning("API attempt %d failed: %s", attempt + 1, e)
-                if attempt == self.max_retries - 1:
-                    raise Exception(f"API call failed: {e}")
-                time.sleep(2 ** attempt)  # 指数退避
-
-    def stream_invoke(self, messages):
-        """
-        流式调用 OpenAI 兼容 API：逐块 yield 增量文本（delta.content）。
-
-        设计约定：
-        - 不在此方法内重试：已产出 token 后再重试会产生重复内容。
-          调用方若「一块都没收到」就失败，可安全回退到 invoke()。
-        - iter_lines() 返回 bytes，自行按 utf-8 解码；不用 decode_unicode=True
-          （其依赖 response.encoding 猜编码，中文场景会乱码）。
-        - timeout 用 (连接超时, 读取超时) 元组，避免长回复被总超时中断。
-        """
-        payload = self._build_payload(messages, stream=True)
-
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers=self.headers,
-            timeout=(HTTP_CONNECT_TIMEOUT, self.timeout),
-            stream=True,
-        )
-        response.raise_for_status()
-
-        try:
-            for raw_line in response.iter_lines():
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    logger.debug("跳过无法解析的流式分片: %r", data[:120])
-                    continue
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                piece = (choices[0].get("delta") or {}).get("content")
-                if piece:
-                    yield piece
-        finally:
-            response.close()
-
-    def chat(self, messages):
-        """兼容LangChain的chat方法"""
-        return self.invoke(messages)
-
-    # 添加LangChain回调管理器接口
-    def bind(self, **kwargs):
-        """绑定参数到客户端"""
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-        return self
-
-    def with_config(self, config):
-        """设置配置"""
-        if hasattr(config, 'get'):
-            for key, value in config.items():
-                setattr(self, key, value)
-        return self
-
-class CustomResponse:
-    def __init__(self, content):
-        self.content = content
-
-# 全局会话管理器（使用 LangChain 标准接口）
-session_manager = default_session_manager
-
 # 延迟初始化LLM
 _llm_instance = None
 
-def initialize_llm_client():
-    """初始化OpenAI兼容API客户端"""
-    if not OPENAI_API_KEY:
-        raise ValueError("API密钥未设置")
-
-    return OpenAICompatibleClient(
-        api_key=OPENAI_API_KEY,
-        base_url=OPENAI_BASE_URL,
-        model=OPENAI_MODEL
-    )
-
 def get_llm():
-    """获取LLM实例，延迟初始化"""
+    """获取LLM实例（langchain-openai ChatOpenAI），延迟初始化。
+
+    使用标准客户端替代此前的手写 HTTP 实现，原生获得：
+    - system 角色正确透传（此前被降级为 user，削弱指令遵从与护栏强度）
+    - 流式 / 重试 / 多模态（image_url 消息为 OpenAI 原生格式）
+    - 与 LangChain 生态（with_structured_output 等）的完整兼容
+    """
     global _llm_instance
     if _llm_instance is None:
+        if not OPENAI_API_KEY:
+            logger.error("API密钥未设置，无法初始化LLM")
+            return None
         try:
-            if not OPENAI_API_KEY:
-                logger.error("API密钥未设置，无法初始化LLM")
-                _llm_instance = None
-            else:
-                _llm_instance = initialize_llm_client()
-                logger.info("成功初始化API客户端")
-        except Exception as e:
-            logger.exception("初始化API客户端失败，将使用模拟响应模式")
+            _llm_instance = ChatOpenAI(
+                model=OPENAI_MODEL,
+                api_key=OPENAI_API_KEY,
+                base_url=OPENAI_BASE_URL,
+                timeout=HTTP_TIMEOUT,
+                max_retries=HTTP_MAX_RETRIES,
+            )
+            logger.info("成功初始化 ChatOpenAI 客户端: model=%s base_url=%s", OPENAI_MODEL, OPENAI_BASE_URL)
+        except Exception:
+            logger.exception("初始化 ChatOpenAI 客户端失败")
             _llm_instance = None
     return _llm_instance
 
@@ -278,16 +93,23 @@ _AGENT_CLASSES = {
 _agent_instances: Dict[str, Any] = {}
 
 def get_agent(agent_name: str):
-    """按需获取智能体实例（首次调用时创建并缓存，后续复用）"""
-    if agent_name not in _agent_instances:
-        cls = _AGENT_CLASSES.get(agent_name)
-        if cls is None:
-            return None
-        agent = cls()
-        agent.set_llm(get_llm())
-        agent.set_session_manager(default_session_manager)
-        _agent_instances[agent_name] = agent
-    return _agent_instances[agent_name]
+    """按需获取智能体实例（首次调用时创建并缓存，后续复用）。
+
+    LLM 未就绪（如 API 密钥缺失导致 get_llm() 返回 None）时不缓存实例，
+    待密钥配置好后下次调用会重新创建，避免 None-LLM 实例被永久固化。
+    """
+    if agent_name in _agent_instances:
+        return _agent_instances[agent_name]
+    cls = _AGENT_CLASSES.get(agent_name)
+    if cls is None:
+        return None
+    agent = cls()
+    agent.set_llm(get_llm())
+    if agent.llm is None:
+        logger.warning("智能体 %s 的 LLM 未就绪（密钥缺失或初始化失败），本次不缓存实例", agent_name)
+        return agent
+    _agent_instances[agent_name] = agent
+    return agent
 
 def _push_stream_status(text: str) -> None:
     """
@@ -330,9 +152,6 @@ def classify_query_node(state: AgentState) -> AgentState:
 
     if "persisted_dialogue" not in state or state.get("persisted_dialogue") is None:
         state["persisted_dialogue"] = []
-
-    if "memory" not in state:
-        state["memory"] = None
 
     if "next_agent" not in state:
         state["next_agent"] = ""
@@ -402,12 +221,6 @@ def classify_query_node(state: AgentState) -> AgentState:
     pd.append(user_turn)
     state["persisted_dialogue"] = pd
 
-    # 同步到内存 session_manager（仅同进程有效；可选）
-    try:
-        session_manager.add_message(session_id, str(customer_query), is_user=True)
-    except Exception as e:
-        logger.warning("添加用户消息到会话失败: %s", e)
-
     # 护栏：超出范围直接固定回复，不进入业务智能体
     if state["query_type"] == "out_of_scope":
         state["response"] = OUT_OF_SCOPE_REPLY
@@ -420,10 +233,6 @@ def classify_query_node(state: AgentState) -> AgentState:
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
         state["persisted_dialogue"] = pd_oos
-        try:
-            session_manager.add_message(session_id, OUT_OF_SCOPE_REPLY, is_user=False)
-        except Exception as e:
-            logger.warning("添加越界拒答到会话失败: %s", e)
         state["tools_used"].append("out_of_scope_refusal")
         return state
 
@@ -436,7 +245,6 @@ def create_agent_node(agent_name: str):
         agent = get_agent(agent_name)
         if agent:
             # 获取会话上下文
-            session_id = state["session_id"]
             state["conversation_history"] = list(state.get("persisted_dialogue") or [])
 
             # 处理查询
@@ -458,12 +266,6 @@ def create_agent_node(agent_name: str):
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             result["persisted_dialogue"] = pd
-
-            # 同步到内存 session_manager（仅同进程有效；可选）
-            try:
-                session_manager.add_message(session_id, str(result["response"]), is_user=False)
-            except Exception as e:
-                logger.warning("添加AI消息到会话失败: %s", e)
 
             return result
         else:
