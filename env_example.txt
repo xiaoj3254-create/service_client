@@ -29,6 +29,14 @@ MAX_CONTENT_LENGTH_MB=32
 # 会话列表一次拉取的最大线程数（服务端默认仅 10）
 # SESSION_LIST_LIMIT=30
 
+# ===== RAG 知识库（可选，见 scripts/build_knowledge_base.py）=====
+# embeddings 模型（SiliconFlow OpenAI 兼容 /embeddings 端点）
+# EMBEDDING_MODEL=BAAI/bge-m3
+# Chroma 持久化目录
+# RAG_PERSIST_DIR=./chroma_db
+# 检索返回的文档块数
+# RAG_TOP_K=3
+
 # ===== Notes =====
 
 # 3. Optional overrides
