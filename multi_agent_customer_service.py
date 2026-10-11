@@ -18,8 +18,14 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# 导入配置
-from config import *
+# 导入配置（显式导入所需常量，避免 import * 污染命名空间）
+from config import (
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    OPENAI_MODEL,
+    HTTP_TIMEOUT,
+    HTTP_MAX_RETRIES,
+)
 
 # 导入智能体和工具
 from multi_agents import (
@@ -27,11 +33,19 @@ from multi_agents import (
     ComplaintAgent, GeneralAgent
 )
 from tools import classify_query
+from tools.query_tools import ClassificationUnavailable
 
 # 超出客服范围时的固定回复（护栏：不调用业务智能体）
 OUT_OF_SCOPE_REPLY = (
     "抱歉，这里是智能客服，仅处理与产品、技术、账单、投诉及相关售后政策类问题；"
     "请用一句话说明您的具体业务诉求，我很乐意协助。"
+)
+
+# 分类基础设施不可用（LLM 连接失败等）时的固定回复：如实告知繁忙，
+# 而非伪装成 out_of_scope 拒答——否则正常业务问题会被误导性文案劝退。
+# 护栏语义不变：同样直达 final_response，绝不路由到业务智能体。
+CLASSIFY_UNAVAILABLE_REPLY = (
+    "抱歉，客服系统暂时繁忙，您的消息未能处理成功，请稍后重试。"
 )
 
 # 定义状态类型
@@ -180,12 +194,17 @@ def classify_query_node(state: AgentState) -> AgentState:
     # 兜底一律取 out_of_scope（保守拒答），绝不默认路由到业务智能体：
     # 分类链路异常时无法判断是否越界，放行存在护栏绕过风险。
     query_type = "out_of_scope"
+    classification_unavailable = False
     try:
         llm_instance = get_llm()
         # 使用正确的工具调用方式
         try:
             result = classify_query.invoke({"query": customer_query, "llm": llm_instance})
             query_type = result
+        except ClassificationUnavailable as e:
+            # LLM 不可达等基础设施故障：如实告知繁忙（而非伪装成越界拒答），护栏不变
+            logger.warning("分类服务暂不可用（LLM 连接失败）: %s", e)
+            classification_unavailable = True
         except Exception as e:
             logger.warning("分类工具调用失败，回退到保守兜底: %s", e)
             # 回退到保守兜底
@@ -221,19 +240,23 @@ def classify_query_node(state: AgentState) -> AgentState:
     pd.append(user_turn)
     state["persisted_dialogue"] = pd
 
-    # 护栏：超出范围直接固定回复，不进入业务智能体
+    # 护栏/兜底：超出范围或分类不可用，直接固定回复，不进入业务智能体
     if state["query_type"] == "out_of_scope":
-        state["response"] = OUT_OF_SCOPE_REPLY
+        if classification_unavailable:
+            state["response"] = CLASSIFY_UNAVAILABLE_REPLY
+            state["tools_used"].append("classification_unavailable")
+        else:
+            state["response"] = OUT_OF_SCOPE_REPLY
+            state["tools_used"].append("out_of_scope_refusal")
         state["current_agent"] = "智能客服"
         state["next_agent"] = "final_response"
         pd_oos = list(state.get("persisted_dialogue") or [])
         pd_oos.append({
-            "content": OUT_OF_SCOPE_REPLY,
+            "content": state["response"],
             "is_user": False,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
         state["persisted_dialogue"] = pd_oos
-        state["tools_used"].append("out_of_scope_refusal")
         return state
 
     return state
@@ -278,10 +301,12 @@ def create_agent_node(agent_name: str):
 # 定义最终响应节点
 def final_response_node(state: AgentState) -> AgentState:
     """Generate final response"""
-    current_agent = state["current_agent"]
-    response = state["response"]
-
-    state["response"] = f"【{current_agent}'s Response】\n{response}"
+    # 不再给 response 加【xx's Response】前缀：
+    # 前端气泡已带「智能客服」署名，前缀会导致非流式接口与流式接口文案不一致；
+    # 智能体归属由 current_agent 字段承载，前端需要时读取。
+    # .get 防御：路由兜底（next_agent 缺失）进来时 current_agent 可能未被设置，
+    # 直接下标会 KeyError 使整个 run 失败。
+    state["current_agent"] = state.get("current_agent", "智能客服")
     # 路由已完成，清空 next_agent 避免残留上一个智能体名称
     state["next_agent"] = ""
     return state

@@ -31,9 +31,6 @@ from chat_web_service import (
     OWNERSHIP_ERROR,
 )
 
-# 导入配置（与历史行为保持一致）
-from config import *  # noqa: E402,F401,F403
-
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 logger = logging.getLogger(__name__)
 
@@ -41,14 +38,29 @@ app = Flask(__name__)
 
 # Flask 配置
 # 生产环境必须设置强 FLASK_SECRET_KEY 环境变量；
-# 未设置或使用已知弱默认值时，生成随机密钥（仅开发可用，重启后 session 失效）。
+# 未设置或使用已知弱默认值时，生成随机密钥并持久化到本地文件（.gitignored）：
+# 重启后沿用同一密钥，避免 Flask session 失效导致匿名用户身份漂移、
+# 会话列表在每次重启后「全部消失」（user_id 隔离的保守策略会使旧线程不可见）。
 _WEAK_SECRET_DEFAULTS = {"", "your-secret-key-here", "change-me", "secret"}
 _flask_secret = os.getenv("FLASK_SECRET_KEY", "")
 if _flask_secret in _WEAK_SECRET_DEFAULTS:
-    logger.warning("FLASK_SECRET_KEY 未设置或为弱默认值，已生成随机密钥（仅开发环境可用，重启后 session 失效）")
-    _flask_secret = secrets.token_hex(32)
+    _key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".flask_secret_key")
+    try:
+        if os.path.exists(_key_file):
+            with open(_key_file, "r", encoding="utf-8") as _f:
+                _flask_secret = _f.read().strip()
+        if not _flask_secret:
+            _flask_secret = secrets.token_hex(32)
+            with open(_key_file, "w", encoding="utf-8") as _f:
+                _f.write(_flask_secret)
+        logger.warning(
+            "FLASK_SECRET_KEY 未设置，已使用本地持久化密钥（%s）；生产环境请设置强密钥环境变量",
+            _key_file,
+        )
+    except OSError:
+        _flask_secret = secrets.token_hex(32)
+        logger.warning("FLASK_SECRET_KEY 未设置且密钥文件不可写，已生成临时随机密钥（重启后 session 失效）")
 app.secret_key = _flask_secret
-app.config['SESSION_TYPE'] = 'filesystem'
 
 # 客户图片限制：base64 解码后单张最大 5MB，最多 4 张
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -158,15 +170,6 @@ def get_conversation_history(session_id: str) -> List[Dict[str, Any]]:
     if 'conversations' not in session:
         session['conversations'] = {}
     return session['conversations'].get(session_id, [])
-
-
-def add_conversation_message(session_id: str, role: str, content: str) -> None:
-    history = get_conversation_history(session_id)
-    history.append({
-        'role': role,
-        'content': content,
-    })
-    session['conversations'][session_id] = history
 
 
 @app.route('/')
@@ -333,7 +336,10 @@ def health_check():
 
 @app.route('/api/test')
 def test_langgraph():
-    """测试 LangGraph API 调用"""
+    """测试 LangGraph API 调用（诊断端点，仅 DEBUG 模式开放）"""
+    # 该端点会返回上游服务响应细节（内部拓扑/错误体），生产环境不应暴露
+    if os.getenv("FLASK_DEBUG", "false").lower() != "true":
+        return jsonify({'error': '未开放'}), 404
     result, err = langgraph_connectivity_test()
     if err:
         return jsonify({'error': err}), 500

@@ -139,7 +139,7 @@ cp env_example.txt .env
 ```powershell
 # Windows PowerShell：必须先设置 UTF-8，否则 langgraph dev 加载 .env 会因 GBK 编码报错
 $env:PYTHONUTF8=1
-langgraph dev --port 2024 --host 0.0.0.0
+langgraph dev --port 2024 --host 127.0.0.1
 ```
 
 **进程 2：Flask Web 应用（端口 5000）**

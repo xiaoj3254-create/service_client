@@ -6,7 +6,12 @@
 import pytest
 
 import multi_agent_customer_service as macs
-from multi_agent_customer_service import OUT_OF_SCOPE_REPLY, classify_query_node
+from multi_agent_customer_service import (
+    CLASSIFY_UNAVAILABLE_REPLY,
+    OUT_OF_SCOPE_REPLY,
+    classify_query_node,
+)
+from tools.query_tools import ClassificationUnavailable
 
 
 class _StubClassifier:
@@ -74,6 +79,22 @@ class TestGuardrail:
         assert state["query_type"] == "out_of_scope"
         assert state["next_agent"] == "final_response"
         assert state["response"] == OUT_OF_SCOPE_REPLY
+
+    def test_classification_unavailable_returns_busy_reply(self, monkeypatch):
+        # LLM 不可达等基础设施故障：返回「系统繁忙」而非误导性越界拒答；
+        # 护栏语义不变——不路由到业务智能体
+        state = _run(monkeypatch, raise_exc=ClassificationUnavailable("Connection error"))
+        assert state["query_type"] == "out_of_scope"
+        assert state["next_agent"] == "final_response"
+        assert state["response"] == CLASSIFY_UNAVAILABLE_REPLY
+        assert "classification_unavailable" in state["tools_used"]
+        assert state["next_agent"] not in (
+            "product_agent", "tech_agent", "billing_agent",
+            "complaint_agent", "general_agent",
+        )
+        # 忙碌回复同样写入持久化对话（用户 + 助手 共两条）
+        assert len(state["persisted_dialogue"]) == 2
+        assert state["persisted_dialogue"][-1]["content"] == CLASSIFY_UNAVAILABLE_REPLY
 
     def test_empty_query_rejected(self):
         state = classify_query_node({"customer_query": "", "session_id": "s"})

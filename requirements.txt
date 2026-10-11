@@ -7,8 +7,9 @@ requests>=2.31.0
 pydantic>=2.7.4
 flask>=2.3.0
 
+# RAG 知识库：tools/rag_tools.py 与 scripts/build_knowledge_base.py 直接 import，
+# 未安装时检索静默降级为硬编码兜底（构建知识库则必须有）
+chromadb>=0.5
+
 # 测试（开发用）：pip install pytest
 # pytest>=8.0
-
-# 可选：RAG 知识库（见 tools/rag_tools.py 与 scripts/build_knowledge_base.py）
-# langchain-chroma>=0.2

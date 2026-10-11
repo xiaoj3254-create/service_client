@@ -12,6 +12,7 @@ RAG 知识检索
 
 import logging
 import os
+import time
 from typing import List, Optional
 
 from config import OPENAI_API_KEY, OPENAI_BASE_URL
@@ -35,13 +36,17 @@ RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
 
 _client = None
 _collection = None
+# 初始化失败原因与时间戳。失败后短路返回 None 避免每次检索都重试报错，
+# 但加 TTL（60s）后自动重试：否则构建知识库后必须重启进程才能恢复 RAG 检索。
 _init_error: Optional[str] = None
+_init_error_at: float = 0.0
+_INIT_ERROR_RETRY_SECONDS: float = float(os.getenv("RAG_INIT_RETRY_SECONDS", "60"))
 
 
 def _get_collection():
-    """惰性获取 Chroma 集合；不可用时返回 None 并记住原因（避免每次检索都重试报错）。"""
-    global _client, _collection, _init_error
-    if _init_error:
+    """惰性获取 Chroma 集合；不可用时返回 None 并记住原因（TTL 内不重复重试）。"""
+    global _client, _collection, _init_error, _init_error_at
+    if _init_error and (time.time() - _init_error_at) < _INIT_ERROR_RETRY_SECONDS:
         return None
     if _collection is not None:
         return _collection
@@ -52,10 +57,12 @@ def _get_collection():
             name=RAG_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+        _init_error = None
         logger.info("RAG 集合就绪: %s (%s)，当前文档数 %d", RAG_COLLECTION_NAME, RAG_PERSIST_DIR, _collection.count())
     except Exception as e:
         _init_error = str(e)
-        logger.warning("RAG 初始化失败，检索将回退到硬编码知识: %s", e)
+        _init_error_at = time.time()
+        logger.warning("RAG 初始化失败，检索将回退到硬编码知识（%ds 后自动重试）: %s", int(_INIT_ERROR_RETRY_SECONDS), e)
         return None
     return _collection
 

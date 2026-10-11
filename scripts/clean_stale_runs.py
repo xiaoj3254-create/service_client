@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -33,7 +34,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("clean_stale_runs")
+
 API = os.getenv("LANGGRAPH_API_URL", "http://127.0.0.1:2024").rstrip("/")
+
+# threads/search 单页大小：默认仅返回 10 条，会漏检后部线程的僵尸 run，必须分页拉全
+PAGE_SIZE = 100
 
 # 只有这两种状态会真正占住 / 排队等待 worker。
 # 注意不要包含 interrupted：那是已停止执行的中断状态，不占用 worker，
@@ -72,19 +82,38 @@ def _format_age(age: Optional[float], status: str) -> str:
     return text
 
 
+def _fetch_all_threads() -> List[Dict[str, Any]]:
+    """分页拉取全部线程，避免默认 10 条截断导致漏检。"""
+    all_threads: List[Dict[str, Any]] = []
+    offset = 0
+    while True:
+        resp = requests.post(
+            f"{API}/threads/search",
+            json={"limit": PAGE_SIZE, "offset": offset},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        all_threads.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return all_threads
+
+
 def fetch_stale_runs() -> Tuple[int, List[Dict[str, Any]]]:
     """返回 (线程总数, 处于 running/pending 的 run 列表)。"""
-    threads = requests.post(f"{API}/threads/search", json={}, timeout=15).json()
+    threads = _fetch_all_threads()
     stale: List[Dict[str, Any]] = []
 
-    for t in threads or []:
+    for t in threads:
         tid = t.get("thread_id")
         if not tid:
             continue
         try:
             runs = requests.get(f"{API}/threads/{tid}/runs", timeout=15).json()
         except Exception as e:
-            print(f"  ! 读取线程 {tid} 的 run 列表失败：{type(e).__name__}: {e}")
+            logger.error("  ! 读取线程 %s 的 run 列表失败：%s: %s", tid, type(e).__name__, e)
             continue
         for r in runs or []:
             if r.get("status") in STALE_STATUSES:
@@ -95,7 +124,7 @@ def fetch_stale_runs() -> Tuple[int, List[Dict[str, Any]]]:
                     "created_at": r.get("created_at"),
                     "age": _age_seconds(r.get("created_at")),
                 })
-    return len(threads or []), stale
+    return len(threads), stale
 
 
 def main() -> int:
@@ -107,43 +136,42 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true", help="跳过二次确认")
     args = parser.parse_args()
 
-    print(f"LangGraph API: {API}\n")
+    logger.info("LangGraph API: %s", API)
 
     try:
         total_threads, stale = fetch_stale_runs()
     except Exception as e:
-        print(f"❌ 无法连接 LangGraph（{API}）：{type(e).__name__}: {e}")
-        print("   请确认 langgraph dev 已启动，或设置 LANGGRAPH_API_URL。")
+        logger.error("❌ 无法连接 LangGraph（%s）：%s: %s", API, type(e).__name__, e)
+        logger.error("   请确认 langgraph dev 已启动，或设置 LANGGRAPH_API_URL。")
         return 2
 
-    print(f"线程总数: {total_threads}")
+    logger.info("线程总数: %d", total_threads)
 
     if not stale:
-        print("未发现 running / pending 的 run，执行队列健康 ✅")
+        logger.info("未发现 running / pending 的 run，执行队列健康 ✅")
         return 0
 
-    print(f"\n⚠️  发现 {len(stale)} 个可能阻塞队列的 run：")
+    logger.warning("⚠️  发现 %d 个可能阻塞队列的 run：", len(stale))
     for item in stale:
-        print(f"  {item['status']:8s} {_format_age(item.get('age'), item['status'])}")
-        print(f"           thread={item['thread_id']}")
-        print(f"           run   ={item['run_id']}")
+        logger.warning("  %-8s %s", item["status"], _format_age(item.get("age"), item["status"]))
+        logger.warning("           thread=%s", item["thread_id"])
+        logger.warning("           run   =%s", item["run_id"])
 
     if not args.cancel:
-        print("\n当前为「只列出」模式，未做任何改动。")
-        print("确认要取消这些 run 时，请加 --cancel（会二次确认）；跳过确认用 --cancel --yes。")
+        logger.info("当前为「只列出」模式，未做任何改动。")
+        logger.info("确认要取消这些 run 时，请加 --cancel（会二次确认）；跳过确认用 --cancel --yes。")
         return 0
 
     if not args.yes:
         try:
             answer = input(f"\n确认取消以上 {len(stale)} 个 run？(y/N) ").strip().lower()
         except EOFError:
-            print("当前环境无法交互确认，请改用 --cancel --yes。未做任何改动。")
+            logger.info("当前环境无法交互确认，请改用 --cancel --yes。未做任何改动。")
             return 0
         if answer not in ("y", "yes"):
-            print("已放弃，未做任何改动。")
+            logger.info("已放弃，未做任何改动。")
             return 0
 
-    print()
     ok = fail = 0
     for item in stale:
         url = f"{API}/threads/{item['thread_id']}/runs/{item['run_id']}/cancel"
@@ -151,19 +179,19 @@ def main() -> int:
             resp = requests.post(url, timeout=30)
             if 200 <= resp.status_code < 300:
                 ok += 1
-                print(f"  ✅ 已取消 {item['status']:9s} {item['run_id']} (HTTP {resp.status_code})")
+                logger.info("  ✅ 已取消 %-9s %s (HTTP %d)", item["status"], item["run_id"], resp.status_code)
             else:
                 fail += 1
-                print(f"  ❌ 取消失败 {item['run_id']} (HTTP {resp.status_code}) {resp.text[:100]}")
+                logger.error("  ❌ 取消失败 %s (HTTP %d) %s", item["run_id"], resp.status_code, resp.text[:100])
         except Exception as e:
             fail += 1
-            print(f"  ❌ 取消失败 {item['run_id']}：{type(e).__name__}: {e}")
+            logger.error("  ❌ 取消失败 %s：%s: %s", item["run_id"], type(e).__name__, e)
 
-    print(f"\n完成：成功 {ok}，失败 {fail}")
+    logger.info("完成：成功 %d，失败 %d", ok, fail)
 
     try:
         _, left = fetch_stale_runs()
-        print("复查后剩余 running / pending：", len(left) if left else "0 ✅")
+        logger.info("复查后剩余 running / pending：%s", len(left) if left else "0 ✅")
     except Exception:
         pass
 

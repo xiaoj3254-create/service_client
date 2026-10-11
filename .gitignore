@@ -351,6 +351,7 @@ public
 .pnp.*
 
 # Project specific
+# 项目特定
 *.db
 *.sqlite
 *.sqlite3
@@ -358,6 +359,8 @@ config.ini
 secrets.json
 .env.local
 .env.production
+# Flask 开发环境持久化密钥（FLASK_SECRET_KEY 未设置时自动生成）
+.flask_secret_key
 
 # Local documentation
 新建会话全链路追踪.md

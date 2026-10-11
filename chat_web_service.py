@@ -43,6 +43,11 @@ LANGGRAPH_SILENCE_TIMEOUT: float = float(
 # 这里显式设置上限，避免 N+1 拉取无界增长，同时保证可见会话数符合预期。
 SESSION_LIST_LIMIT: int = int(os.getenv("SESSION_LIST_LIMIT", "30"))
 
+# 同步/轮询路径等待 run 完成的上限（秒）。等待期间会占住一个 Flask worker 线程，
+# 过长的上限意味着少量并发请求即可耗尽 dev server 线程池。正常一轮（分类+回答）
+# 远小于该值，超时基本意味着服务端排队或故障。
+RUN_WAIT_TIMEOUT: int = int(os.getenv("RUN_WAIT_TIMEOUT", "60"))
+
 # 模块级 Session 复用 TCP 连接（keep-alive），避免每次调用 /threads/* 都重新握手。
 # HTTPAdapter 的连接池是线程安全的，可安全用于会话列表中的并发拉取。
 _http = requests.Session()
@@ -421,35 +426,41 @@ def fetch_sessions_list(user_id: str) -> Tuple[Optional[List[Dict[str, Any]]], O
             return None, f'获取会话列表失败: {response.status_code}'
 
         threads = response.json()
-        sessions: List[Dict[str, Any]] = []
+        sessions: List[Tuple[int, Dict[str, Any]]] = []
 
-        # 并发拉取各线程 state，避免串行 N 次请求导致的长延迟
+        # 并发拉取各线程 state，避免串行 N 次请求导致的长延迟。
+        # 记录服务端排序索引（updated_at desc）：as_completed 的完成顺序是随机的，
+        # 直接 append 会打散「最近活跃在前」的顺序，拼装完成后需按原索引还原。
         with ThreadPoolExecutor(max_workers=8) as executor:
             future_map = {
-                executor.submit(_fetch_thread_state_info, t.get("thread_id", "")): t
-                for t in threads
+                executor.submit(_fetch_thread_state_info, t.get("thread_id", "")): (idx, t)
+                for idx, t in enumerate(threads)
             }
             for future in as_completed(future_map):
-                thread = future_map[future]
+                idx, thread = future_map[future]
                 thread_id = thread.get("thread_id", "")
                 created_at = _normalize_created_at(thread.get("created_at", time.time()))
                 try:
                     message_count, last_user_question, search_text = future.result()
                 except Exception:
                     message_count, last_user_question, search_text = 0, "", ""
-                sessions.append({
+                sessions.append((idx, {
                     "session_id": thread_id,
                     "created_at": created_at,
                     "message_count": message_count,
                     "last_user_question": last_user_question,
                     "search_text": search_text,
-                })
+                }))
 
-        return sessions, None
+        # 还原服务端 updated_at desc 顺序
+        sessions.sort(key=lambda pair: pair[0])
+        ordered_sessions = [item for _, item in sessions]
+
+        return ordered_sessions, None
 
     except Exception as e:
         logger.exception("获取会话列表时出错")
-        return None, f'服务器错误: {str(e)}'
+        return None, '服务器错误，请稍后重试'
 
 
 def fetch_session_detail(session_id: str, user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -490,7 +501,7 @@ def fetch_session_detail(session_id: str, user_id: str) -> Tuple[Optional[Dict[s
 
     except Exception as e:
         logger.exception("获取会话详情时出错")
-        return None, f'服务器错误: {str(e)}'
+        return None, '服务器错误，请稍后重试'
 
 
 def delete_remote_thread(thread_id: str, user_id: str) -> Tuple[bool, int]:
@@ -594,7 +605,7 @@ def run_chat_sync(
         run_id = result["run_id"]
 
         run_status = "running"
-        max_wait_time = 120
+        max_wait_time = RUN_WAIT_TIMEOUT
         wait_start = time.time()
 
         while run_status in ["running", "pending"]:
@@ -635,7 +646,7 @@ def run_chat_sync(
 
     except Exception as e:
         logger.exception("聊天处理错误")
-        return None, f'内部错误: {str(e)}', 500, thread_id
+        return None, '服务器内部错误，请稍后重试', 500, thread_id
 
 
 def _sse(payload: Dict[str, Any]) -> str:
@@ -804,8 +815,8 @@ def stream_chat_events(
                             continue
                         resp_text = delta.get("response")
                         if node_name == "final_response":
-                            # final_response 会给正文加【xx's Response】前缀：
-                            # 仅在拿不到更干净的 agent 原始回复时才用它兜底
+                            # final_response 节点只是路由收尾（正文在业务智能体节点产出）：
+                            # 仅在拿不到业务智能体原始回复时才用它兜底
                             if resp_text and not fallback_text:
                                 fallback_text = str(resp_text)
                             continue
@@ -924,7 +935,7 @@ def _stream_chat_events_by_polling(
             return
 
         run_status = "running"
-        max_wait_time = 120
+        max_wait_time = RUN_WAIT_TIMEOUT
         wait_start = time.time()
 
         while run_status in ["running", "pending"]:
@@ -971,7 +982,7 @@ def _stream_chat_events_by_polling(
 
     except Exception as e:
         logger.exception("轮询式流式处理错误")
-        yield _sse({'error': f'流式处理错误: {str(e)}'})
+        yield _sse({'error': '服务器内部错误，请稍后重试'})
 
     yield "data: [DONE]\n\n"
 

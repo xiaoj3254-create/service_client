@@ -28,6 +28,25 @@ _CLASS_LABELS: Tuple[str, ...] = (
 # general_inquiry 会把一次正确的拒绝改判成正常业务咨询，护栏在最该生效的场景失效。
 _FALLBACK_LABEL = "out_of_scope"
 
+
+class ClassificationUnavailable(Exception):
+    """分类基础设施不可用（LLM 连接失败/超时等），区别于「模型判定越界」。
+
+    抛出该异常时调用方应返回「系统繁忙」类提示并保持护栏（不路由到业务智能体），
+    而不是伪装成 out_of_scope 拒答——否则正常的业务问题会被误导性文案劝退。
+    """
+
+
+def _is_connection_error(e: Exception) -> bool:
+    """判断异常是否属于网络连接类（连接失败/超时/DNS/SSL），用于快速失败。"""
+    if isinstance(e, ClassificationUnavailable):
+        return True
+    s = str(e).lower()
+    return any(k in s for k in (
+        "connection error", "connection reset", "connect", "timed out",
+        "timeout", "getaddrinfo", "ssl", "temporarily unavailable",
+    ))
+
 # 拒答/越界语义的中文表述（子串命中即视为 out_of_scope），
 # 用于补救分类模型未按规定输出标签、而以自然语言表达的拒绝。
 _REFUSAL_MARKERS: Tuple[str, ...] = (
@@ -121,11 +140,15 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个查询分类专家。请根据客户查
 
 @tool
 def classify_query(query: str, llm=None) -> str:
-    """根据客户查询内容分类查询类型（含 out_of_scope：非客服/越狱等）。"""
+    """根据客户查询内容分类查询类型（含 out_of_scope：非客服/越狱等）。
+
+    Raises:
+        ClassificationUnavailable: LLM 不可达/超时等基础设施故障（区别于判定越界）。
+    """
 
     if llm is None:
-        logger.warning("classify_query 未收到 LLM 实例，保守兜底")
-        return _FALLBACK_LABEL
+        logger.warning("classify_query 未收到 LLM 实例")
+        raise ClassificationUnavailable("LLM 实例未就绪")
 
     messages = [
         SystemMessage(content=_CLASSIFY_SYSTEM_PROMPT),
@@ -144,9 +167,14 @@ def classify_query(query: str, llm=None) -> str:
             logger.debug("classify_query 输入=%r 结构化输出=%s", query[:60], normalized)
             return normalized
         logger.warning("classify_query 结构化输出缺少 label 字段，回退文本分类")
+    except ClassificationUnavailable:
+        raise
     except Exception as e:
-        # 结构化输出依赖模型的 function calling / json mode 能力，
-        # 网关或模型不支持时回退到原「提示词 + 归一化」路径，行为与旧版一致。
+        # 连接类故障（网关不可达/超时）走文本路径也必然失败（同一网络），
+        # 快速失败可省去第二路径的 ~10s 无效重试；其余（schema/解析类）回退文本分类。
+        if _is_connection_error(e):
+            logger.warning("classify_query 结构化输出连接失败: %s", e)
+            raise ClassificationUnavailable(str(e)) from e
         logger.warning("classify_query 结构化输出不可用，回退文本分类: %s", e)
 
     try:
@@ -155,7 +183,13 @@ def classify_query(query: str, llm=None) -> str:
         normalized = normalize_classifier_label(result)
         logger.debug("classify_query 输入=%r 原始输出=%r 规范化=%s", query[:60], result[:120], normalized)
         return normalized
+    except ClassificationUnavailable:
+        raise
     except Exception as e:
+        # 网络类故障：如实上报基础设施不可用；其他异常（模型输出异常等）保守兜底
+        if _is_connection_error(e):
+            logger.warning("classify_query 文本分类连接失败: %s", e)
+            raise ClassificationUnavailable(str(e)) from e
         logger.warning("classify_query 出错，保守兜底: %s", e)
         # 分类失败时同样保守兜底：宁可拒答，也不把未知请求路由给业务智能体
         return _FALLBACK_LABEL
