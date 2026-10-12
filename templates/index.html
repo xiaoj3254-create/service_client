@@ -1700,13 +1700,13 @@
                         <span>刷新列表</span>
                     </button>
                     <button type="button" class="session-btn session-btn-accent-api" onclick="testLangGraphAPI()"
-                        title="API测试">
+                        title="连通性测试">
                         <svg class="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
                             stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
                             aria-hidden="true">
                             <path d="M16 18l6-6-6-6M8 6l-6 6 6 6M14 4l-4 16" />
                         </svg>
-                        <span>API测试</span>
+                        <span>连通性</span>
                     </button>
                 </div>
                 <div class="sidebar-title">最近对话</div>
@@ -2229,8 +2229,10 @@
                 s.onerror = function () { window.__MarkdownLibLoadFailed = true; };
                 document.head.appendChild(s);
             };
-            load('https://cdn.jsdelivr.net/npm/marked@13.0.3/marked.min.js');
-            load('https://cdn.jsdelivr.net/npm/dompurify@3.2.5/dist/purify.min.js');
+            // 本地静态资源（static/vendor/，随应用分发）：国内访问 jsdelivr 不稳定，
+            // 且离线/内网部署时 CDN 缺失会导致 Markdown 渲染静默降级
+            load('/static/vendor/marked.min.js');
+            load('/static/vendor/purify.min.js');
         }
 
         // 页面初始化：脚本位于 body 末尾，DOM 已就绪，立即执行。
@@ -3352,38 +3354,29 @@
             }
         })();
 
-        // 测试 LangGraph API 连接
+        // 测试服务连通性（健康检查 + 数据库探测）
         async function testLangGraphAPI() {
             try {
-                console.log('🧪 开始测试 LangGraph API...');
+                console.log('🧪 开始测试服务连通性...');
 
-                const response = await fetch('/api/test');
+                const response = await fetch('/api/health');
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
 
                 const data = await response.json();
-                console.log('🧪 API 测试结果:', data);
+                console.log('🧪 连通性测试结果:', data);
 
-                if (data.error) {
-                    addSystemMessage('❌ API 测试失败: ' + data.error);
+                if (data.status === 'healthy') {
+                    addSystemMessage('🧪 连通性正常: ✅ 服务 | ✅ 数据库');
+                } else if (data.status === 'degraded') {
+                    addSystemMessage('🧪 连通性降级: ✅ 服务 | ❌ 数据库');
                 } else {
-                    const ok = (code) => typeof code === 'number' && code >= 200 && code < 300;
-                    const status = [];
-                    if (ok(data.health_check)) status.push('✅ 健康检查');
-                    else status.push('❌ 健康检查');
-
-                    if (ok(data.threads_search)) status.push('✅ 线程搜索');
-                    else status.push('❌ 线程搜索');
-
-                    if (ok(data.assistants_search)) status.push('✅ 助手搜索');
-                    else status.push('❌ 助手搜索');
-
-                    addSystemMessage(`🧪 API 测试完成: ${status.join(' | ')}`);
+                    addSystemMessage('❌ 连通性异常: 未知状态 ' + (data.status || ''));
                 }
             } catch (error) {
-                console.error('🧪 API 测试失败:', error);
-                addSystemMessage('❌ API 测试失败: ' + error.message);
+                console.error('🧪 连通性测试失败:', error);
+                addSystemMessage('❌ 连通性测试失败: ' + error.message);
             }
         }
 

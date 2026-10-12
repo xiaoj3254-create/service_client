@@ -3,7 +3,7 @@ import base64
 
 import pytest
 
-import web_app
+from app import validation as web_app
 
 
 def _b64(data: bytes) -> str:

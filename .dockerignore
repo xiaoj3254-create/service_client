@@ -1,0 +1,25 @@
+# 构建上下文瘦身：本地/开发产物一律不进镜像
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.git/
+.github/
+.idea/
+.vscode/
+
+# 运行时产物（compose 挂载卷或运行时生成）
+.env
+.flask_secret_key
+chroma_db/
+.langgraph_api/
+langgraph_cache/
+*.log
+logs/
+
+# 本地文档与工作区数据
+doc/
+.workbuddy/
+*.md
+!README.md

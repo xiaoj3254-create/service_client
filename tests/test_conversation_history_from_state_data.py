@@ -1,6 +1,6 @@
 """conversation_history_from_state_data / append_turn_from_state 单元测试：
 线程 state JSON 解析优先级、response 去重、图片透传（防止双气泡回归）。"""
-from chat_web_service import (
+from app.history import (
     append_turn_from_state,
     conversation_history_from_state_data,
     last_user_question_from_history,
