@@ -13,8 +13,11 @@ RUN pip install --no-cache-dir -r requirements.lock.txt
 
 COPY . .
 
-# 非 root 运行；chroma_db / .flask_secret_key 由挂载卷或运行时生成
-RUN useradd -m appuser && chown -R appuser:appuser /app
+# 非 root 运行；chroma_db / session_keys 由挂载卷或运行时生成。
+# 预建 session_keys 并赋权：compose 命名卷首挂时继承镜像内目录属主，保证 appuser 可写
+RUN useradd -m appuser \
+    && mkdir -p /app/session_keys \
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000

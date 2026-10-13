@@ -15,6 +15,7 @@ from app.config import AINVOKE_TIMEOUT, DATABASE_URL, SESSION_LIST_LIMIT
 from app.db import OWNERSHIP_ERROR, get_threads_store, new_thread_id
 from app.history import (
     conversation_history_from_state_data,
+    extract_ai_response,
     last_user_question_from_history,
     message_count_from_state_data,
 )
@@ -83,9 +84,10 @@ async def ensure_thread(client_session_id: Optional[str], user_id: str) -> str:
 
 
 def build_run_input(user_message: str, images: Optional[List[str]], thread_id: str) -> Dict[str, Any]:
-    """工作流输入；customer_images 无图时也显式写 None，防止上一轮图片残留。"""
+    """工作流输入；customer_images 无图时也显式写 None，防止上一轮图片残留。
+    不传 messages：图内对话上下文完全由 persisted_dialogue 承载（经 checkpointer 持久化）。
+    """
     return {
-        "messages": [{"role": "user", "content": user_message}],
         "customer_query": user_message,
         "customer_images": images,
         "session_id": thread_id,
@@ -182,6 +184,8 @@ async def stream_reply(
 
     except Exception as e:
         logger.exception("进程内图流式运行出错")
+        # 失败轮也回写统计，避免侧栏停留在上一轮预览（内部已有 try/except，不会抛出）
+        await update_thread_stats(thread_id)
         if accumulated:
             # 已推给前端部分正文：用已累积内容收尾，绝不重跑
             yield _sse({
@@ -206,7 +210,6 @@ async def stream_reply(
         try:
             graph = await get_graph()
             snap = await graph.aget_state(_config(thread_id))
-            from app.history import extract_ai_response
             full_text = extract_ai_response({"values": snap.values or {}})
             if full_text == "抱歉，我无法理解您的问题。":
                 full_text = ""  # state 里确实没有回复
@@ -303,6 +306,34 @@ async def fetch_sessions_list(user_id: str) -> List[Dict[str, Any]]:
     return await get_threads_store().list_for_user(user_id, SESSION_LIST_LIMIT)
 
 
+async def cleanup_expired_threads(retention_seconds: float, batch: int) -> int:
+    """删除 updated_at 早于保留期的会话（注册表行 + checkpoint 数据），返回本批删除数。
+
+    由 app.main 的后台定期任务调用。与手动删除 delete_thread 语义一致：
+    先删注册表行（delete_older_than 返回已删行，天然幂等），再尽力清理
+    checkpoint，单条失败仅记日志不阻断（孤儿 checkpoint 无法再被任何
+    user_id 访问，仅为磁盘占用）。
+    """
+    store = get_threads_store()
+    deleted = await store.delete_older_than(retention_seconds, batch)
+    if not deleted:
+        return 0
+
+    graph = await get_graph()
+    checkpoint_failures = 0
+    for row in deleted:
+        try:
+            await graph.checkpointer.adelete_thread(row["thread_id"])
+        except Exception:
+            checkpoint_failures += 1
+            logger.exception("清理过期线程 checkpoint 失败: %s", row["thread_id"])
+    logger.info(
+        "过期会话清理完成：%d 个注册表行已删（保留期 %.0f 天），checkpoint 清理失败 %d 个",
+        len(deleted), retention_seconds / 86400, checkpoint_failures,
+    )
+    return len(deleted)
+
+
 __all__ = [
     "OWNERSHIP_ERROR",
     "ensure_thread",
@@ -313,4 +344,5 @@ __all__ = [
     "delete_thread",
     "clear_thread_and_create_new",
     "close_graph",
+    "cleanup_expired_threads",
 ]

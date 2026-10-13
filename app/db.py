@@ -9,6 +9,7 @@
     list_for_user(user_id, limit) -> List[dict]   # updated_at desc
     update_stats(thread_id, message_count=..., last_user_question=..., search_text=...)
     delete(thread_id, user_id) -> bool
+    delete_older_than(max_age_seconds, limit) -> List[dict]  # 保留策略批量删除
     initialize() / close()
 """
 
@@ -76,6 +77,10 @@ class MemoryThreadsStore:
     async def initialize(self) -> None:
         pass
 
+    async def ping(self) -> bool:
+        """健康检查探测；进程内存储恒可用。"""
+        return True
+
     async def get(self, thread_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         row = self._rows.get(thread_id)
         if row and row["user_id"] == user_id:
@@ -115,6 +120,17 @@ class MemoryThreadsStore:
             return True
         return False
 
+    async def delete_older_than(self, max_age_seconds: float, limit: int) -> List[Dict[str, Any]]:
+        """删除 updated_at 早于保留期的线程，返回 [{thread_id, user_id}]（最旧优先，限量）。"""
+        cutoff = time.time() - max_age_seconds
+        expired = sorted(
+            (r for r in self._rows.values() if r["updated_at"] < cutoff),
+            key=lambda r: r["updated_at"],
+        )[:limit]
+        for r in expired:
+            self._rows.pop(r["session_id"], None)
+        return [{"thread_id": r["session_id"], "user_id": r["user_id"]} for r in expired]
+
     async def close(self) -> None:
         pass
 
@@ -132,6 +148,17 @@ class PgThreadsStore:
             for stmt in _DDL_STATEMENTS:
                 await conn.execute(stmt)
         logger.info("threads 注册表 DDL 就绪")
+
+    async def ping(self) -> bool:
+        """健康检查探测：连接池执行轻量查询，失败返回 False（不抛异常）。"""
+        try:
+            pool = await self._get_pool()
+            async with pool.connection() as conn:
+                await conn.execute("SELECT 1")
+            return True
+        except Exception:
+            logger.exception("健康检查探测数据库失败")
+            return False
 
     async def _get_pool(self) -> Any:
         if self._pool is None:
@@ -189,6 +216,29 @@ class PgThreadsStore:
                 (thread_id, user_id),
             )
             return cur.rowcount > 0
+
+    async def delete_older_than(self, max_age_seconds: float, limit: int) -> List[Dict[str, Any]]:
+        """删除 updated_at 早于保留期的线程，返回 [{thread_id, user_id}]（最旧优先，限量）。
+
+        Postgres 无 DELETE LIMIT，用子查询圈定本批最旧的过期行；
+        按 thread_id 幂等，多 worker 并发执行时后到者删到空集，无害。
+        """
+        pool = await self._get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                DELETE FROM app_threads WHERE thread_id IN (
+                    SELECT thread_id FROM app_threads
+                    WHERE updated_at < now() - make_interval(secs => %s)
+                    ORDER BY updated_at
+                    LIMIT %s
+                )
+                RETURNING thread_id, user_id
+                """,
+                (int(max_age_seconds), limit),
+            )
+            rows = await cur.fetchall()
+        return [{"thread_id": r[0], "user_id": r[1]} for r in rows]
 
     async def close(self) -> None:
         if self._pool is not None:

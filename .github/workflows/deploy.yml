@@ -19,10 +19,26 @@ env:
 jobs:
   build-push:
     runs-on: ubuntu-latest
-    # workflow_run 触发时要求上游 CI 成功；手动触发无条件执行
+    # workflow_run 触发时要求上游 CI 成功；手动触发在下方步骤内补跑测试门禁
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
+
+      # workflow_run 路径上游 CI 已跑过测试；手动触发绕过了 CI，必须在此补门禁，
+      # 防止未验证代码经 latest 标签被 Watchtower 60s 内自动推上生产
+      - name: 手动触发时先跑测试
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装依赖并运行测试（仅手动触发）
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock.txt
+          PYTHONUTF8=1 python -m pytest tests/ -q
 
       - uses: docker/setup-buildx-action@v3
 

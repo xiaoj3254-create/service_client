@@ -50,7 +50,12 @@ def load_session_secret() -> str:
     _secret = os.getenv("SESSION_SECRET_KEY", "")
     if _secret not in _WEAK_SECRET_DEFAULTS:
         return _secret
-    _key_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".flask_secret_key")
+    # 容器部署时务必把该文件落到挂载卷内（见 docker-compose 的 SESSION_SECRET_KEY_FILE），
+    # 否则镜像更新重建容器后密钥随旧容器丢失，所有匿名会话被拒签失效
+    _key_file = os.getenv(
+        "SESSION_SECRET_KEY_FILE",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".flask_secret_key"),
+    )
     try:
         _secret = _load_or_create_key_file(_key_file)
         import logging
@@ -84,3 +89,13 @@ AINVOKE_TIMEOUT: int = int(os.getenv("AINVOKE_TIMEOUT", "120"))
 
 # 会话列表一次返回的最大线程数
 SESSION_LIST_LIMIT: int = int(os.getenv("SESSION_LIST_LIMIT", "30"))
+
+# --- 会话保留策略（后台定期清理）---
+# 会话保留天数：updated_at 超过该时长的线程连同 checkpoint 数据一并删除。
+# 0 = 关闭清理（数据永久保留）。匿名 Cookie 无账号，用户离开后旧会话无人认领，
+# 不清理会无限累积（含图片 base64 的 checkpoint 体积增长较快）。
+SESSION_RETENTION_DAYS: int = int(os.getenv("SESSION_RETENTION_DAYS", "90"))
+# 清理任务执行间隔（秒）；每 worker 独立执行，删除按 thread_id 幂等，重复执行无害
+SESSION_CLEANUP_INTERVAL_SECONDS: int = int(os.getenv("SESSION_CLEANUP_INTERVAL_SECONDS", "21600"))  # 6h
+# 单次清理最多删除的线程数（分批进行，避免一次占连接池太久）
+SESSION_CLEANUP_BATCH: int = int(os.getenv("SESSION_CLEANUP_BATCH", "200"))

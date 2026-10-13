@@ -1,5 +1,6 @@
 """聊天路由：非流式 /api/chat 与流式 /api/chat/stream（SSE）。"""
 
+import json
 import logging
 from typing import Any, Dict
 
@@ -20,7 +21,6 @@ async def _parse_payload(request: Request) -> Any:
     body = await request.body()
     if not body:
         return {}
-    import json
     try:
         return json.loads(body)
     except ValueError:
