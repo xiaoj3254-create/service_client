@@ -6,6 +6,8 @@
 from .base_agent import BaseAgent
 
 class GeneralAgent(BaseAgent):
+    domain = "general"  # RAG 领域标识（knowledge/general/）
+
     def __init__(self):
         super().__init__(
             name="综合客服",

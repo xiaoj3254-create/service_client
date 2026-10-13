@@ -81,7 +81,7 @@
     }
   },
   "http": {
-    "port": 8123,
+    "port": 2024,
     "host": "0.0.0.0"
   }
 }
@@ -94,7 +94,7 @@
 | `graphs.customer_service` | 图入口（文件路径:函数名） | `make_graph` |
 | `python_version` | 运行时 Python 版本 | `3.13` |
 | `base_image` | Docker 基础镜像 | `langchain/langgraph-api:0.2` |
-| `http.port` / `http.host` | API 服务监听地址 | `8123` / `0.0.0.0` |
+| `http.port` / `http.host` | API 服务监听地址 | `2024` / `0.0.0.0` |
 | `store.ttl.default_ttl` | Store 默认 TTL（分钟，10080 = 7 天） | `10080` |
 | `checkpointer.ttl.default_ttl` | Checkpoint TTL（分钟，43200 = 30 天） | `43200` |
 

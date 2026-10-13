@@ -6,6 +6,8 @@
 from .base_agent import BaseAgent
 
 class ComplaintAgent(BaseAgent):
+    domain = "complaint"  # RAG 领域标识（knowledge/complaint/）
+
     def __init__(self):
         super().__init__(
             name="投诉处理专家",

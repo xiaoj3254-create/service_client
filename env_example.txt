@@ -6,28 +6,54 @@ OPENAI_API_KEY=your_siliconflow_api_key_here
 OPENAI_BASE_URL=https://api.siliconflow.cn/v1
 OPENAI_MODEL=Qwen/Qwen3-8B
 
-# ===== HTTP client =====
+# ===== HTTP client (LLM/embeddings) =====
 HTTP_TIMEOUT=30
 HTTP_MAX_RETRIES=3
 
 # ===== Logging =====
 LOG_LEVEL=INFO
 
-# ===== Flask web app (web_app.py) =====
-FLASK_PORT=5000
-FLASK_DEBUG=False
-FLASK_SECRET_KEY=your-secret-key-here
+# ===== Database (PostgreSQL) =====
+# checkpointer 与线程注册表共用。生产（compose）必须设置；
+# compose 部署时由 docker-compose.yml 自动注入，无需在此配置。
+# 本地开发不设置则退化为进程内存储（单 worker，重启丢失）。
+# DATABASE_URL=postgresql://cs:cs_pass@localhost:5432/customer_service
+POSTGRES_USER=cs
+POSTGRES_PASSWORD=cs_pass_change_me
+POSTGRES_DB=customer_service
 
-# LangGraph HTTP API (see chat_web_service.py)
-# LANGGRAPH_API_URL=http://127.0.0.1:2024
-# LANGGRAPH_GRAPH_NAME=customer_service
+# ===== Session cookie =====
+# 生产必须设置强随机密钥（如 openssl rand -hex 32）
+SESSION_SECRET_KEY=your-strong-random-secret-here
+# 生产（HTTPS）开启
+SESSION_COOKIE_SECURE=False
+SESSION_SAME_SITE=lax
+
+# ===== Request limits =====
+# 单条消息最大字符数（超出返回 400）
+MAX_QUERY_CHARS=2000
+# 请求体总大小上限（MB），需容纳最多 4 张 5MB 图片的 base64；与 nginx client_max_body_size 对齐
+MAX_CONTENT_LENGTH_MB=32
+# 聊天接口限流（次/分钟/用户，进程内滑动窗口）
+RATE_LIMIT_CHAT_PER_MIN=10
+# IP 维度限流（次/分钟/IP，防无 Cookie 脚本换 user_id 绕过；NAT 多人场景建议为用户窗口 3 倍）
+RATE_LIMIT_IP_PER_MIN=30
+# 非流式单轮整体超时（秒）
+AINVOKE_TIMEOUT=120
+
+# ===== Sessions =====
+# 会话列表一次返回的最大线程数
+SESSION_LIST_LIMIT=30
+
+# ===== RAG knowledge base (see scripts/build_knowledge_base.py) =====
+# embeddings 模型（SiliconFlow OpenAI 兼容 /embeddings 端点）
+# EMBEDDING_MODEL=BAAI/bge-m3
+# Chroma 持久化目录（compose 挂载 chroma_data 卷）
+# RAG_PERSIST_DIR=./chroma_db
+# 检索返回的文档块数
+# RAG_TOP_K=3
 
 # ===== Notes =====
-
-# 3. Optional overrides
-# To change timeout or retries, edit e.g.:
-# HTTP_TIMEOUT=60
-# HTTP_MAX_RETRIES=5
-
-# Windows: if `langgraph dev` fails loading .env with UnicodeDecodeError, keep comments
-# ASCII-only (as here) or save .env as UTF-8 with BOM.
+# Windows 本地开发：PYTHONUTF8=1 必须设置，否则 langgraph/日志中文输出会 GBK 解码报错。
+# 部署：docker compose up -d --build；知识库构建：
+#   docker compose exec app python scripts/build_knowledge_base.py

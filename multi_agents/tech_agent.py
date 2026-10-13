@@ -6,6 +6,8 @@
 from .base_agent import BaseAgent
 
 class TechAgent(BaseAgent):
+    domain = "tech"  # RAG 领域标识（knowledge/tech/）
+
     def __init__(self):
         super().__init__(
             name="技术支持专家",

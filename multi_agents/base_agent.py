@@ -7,26 +7,23 @@ import logging
 from typing import Dict, List, Any, Optional
 from abc import ABC, abstractmethod
 from langchain_core.messages import HumanMessage, SystemMessage
-from session_manager import LangChainSessionManager
 
 logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
-    def __init__(self, name: str, role: str, expertise: List[str], session_manager: LangChainSessionManager = None):
+    # RAG 领域标识（子类覆盖），对应 knowledge/<domain>/ 目录与 Chroma 元数据过滤
+    domain: str = ""
+
+    def __init__(self, name: str, role: str, expertise: List[str]):
         self.name = name
         self.role = role
         self.expertise = expertise
         self.llm = None  # 将在运行时注入
-        self.session_manager = session_manager or LangChainSessionManager()
 
     def set_llm(self, llm):
         """设置LLM客户端"""
         self.llm = llm
-
-    def set_session_manager(self, session_manager: LangChainSessionManager):
-        """设置会话管理器"""
-        self.session_manager = session_manager
 
     def _build_human_message(self, text: str, state: Optional[Dict[str, Any]] = None) -> HumanMessage:
         """
@@ -51,7 +48,7 @@ class BaseAgent(ABC):
 
     @abstractmethod
     def _match_data(self, query: str) -> str:
-        """根据用户查询匹配领域知识库，返回格式化的上下文文本；无匹配时返回空串。"""
+        """根据用户查询匹配领域知识库（硬编码兜底），返回格式化的上下文文本；无匹配时返回空串。"""
 
     # ------------------------------------------------------------------
     # 可选覆盖的方法
@@ -65,11 +62,23 @@ class BaseAgent(ABC):
     # 公共流程模板（所有领域 agent 共用）
     # ------------------------------------------------------------------
 
+    def _retrieve_knowledge(self, query: str) -> str:
+        """获取领域知识：RAG 向量检索优先，不可用/无命中时回退子类硬编码匹配。"""
+        try:
+            from tools.rag_tools import retrieve
+            rag_result = retrieve(query, self.domain)
+            if rag_result:
+                return rag_result
+        except Exception as e:
+            # rag_tools 导入失败等异常同样降级，不阻断对话
+            logger.debug("%s RAG 检索异常，回退硬编码匹配: %s", self.name, e)
+        return self._match_data(query)
+
     def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         处理客户查询的模板方法。
-        公共流程：取查询 -> 取对话上下文 -> 匹配领域数据 -> 构建消息 -> 调 LLM -> 写 state。
-        子类只需实现 _get_system_prompt / _match_data，可覆盖 _get_error_fallback。
+        公共流程：取查询 -> 取对话上下文 -> 获取领域知识（RAG 优先）-> 构建消息 -> 调 LLM -> 写 state。
+        子类只需实现 _get_system_prompt / _match_data（兜底），可覆盖 _get_error_fallback。
         """
         customer_query = state["customer_query"]
         session_id = state.get("session_id", "default")
@@ -77,8 +86,8 @@ class BaseAgent(ABC):
         # 对话轮次由 classify / 外层节点写入 persisted_dialogue，此处只读 state
         conversation_context = self._get_conversation_context(session_id, state)
 
-        # 从领域知识库匹配相关信息
-        matched_info = self._match_data(customer_query)
+        # 从领域知识库匹配相关信息（RAG 优先，硬编码兜底）
+        matched_info = self._retrieve_knowledge(customer_query)
 
         # 构建系统提示并增强对话上下文说明
         base_system_prompt = self._get_system_prompt()
@@ -127,8 +136,7 @@ class BaseAgent(ABC):
 
         以下任一情况都自动回退到原有阻塞 invoke()，行为与改动前一致：
         - 非流式上下文（独立脚本运行、直接调用 process）
-        - LLM 客户端未提供 stream_invoke
-        - 流式调用在产出任何内容之前就失败
+        - 流式调用在产出任何内容之前就失败（已产出部分内容时绝不重试，防止重复文本）
         """
         writer = None
         try:
@@ -138,11 +146,12 @@ class BaseAgent(ABC):
         except Exception:
             writer = None
 
-        stream_fn = getattr(self.llm, "stream_invoke", None)
-        if writer is not None and callable(stream_fn):
+        if writer is not None and self.llm is not None:
             collected: List[str] = []
             try:
-                for piece in stream_fn(messages):
+                # ChatOpenAI 原生 stream()：逐 chunk 产出 AIMessageChunk
+                for chunk in self.llm.stream(messages):
+                    piece = getattr(chunk, "content", None)
                     if not piece:
                         continue
                     collected.append(piece)
@@ -177,43 +186,26 @@ class BaseAgent(ABC):
         state: Optional[Dict[str, Any]] = None,
         max_messages: int = 12,
     ) -> str:
-        """优先使用图状态中持久化的对话（跨 LangGraph 进程/工作有效），否则回退到 session_manager。"""
-        if state is not None:
-            records = state.get("persisted_dialogue")
-            if records:
-                tail = records[-max_messages:]
-                context_lines = []
-                for msg in tail:
-                    role = "用户" if msg.get("is_user", True) else "AI"
-                    content = msg.get("content", "")
-                    timestamp = msg.get("timestamp", "")
-                    context_lines.append(f"[{timestamp}] {role}: {content}")
-                return "\n".join(context_lines)
-        try:
-            conversation_context = self.session_manager.get_conversation_context(session_id, max_messages)
-
-            if not conversation_context:
-                return ""
-
-            # 格式化对话历史
-            context_lines = []
-            for msg in conversation_context:
-                role = "用户" if msg.get("is_user", True) else "AI"
-                content = msg.get("content", "")
-                timestamp = msg.get("timestamp", "")
-                context_lines.append(f"[{timestamp}] {role}: {content}")
-
-            return "\n".join(context_lines)
-        except Exception as e:
-            logger.warning("获取对话上下文时出错: %s", e)
+        """从图状态 persisted_dialogue 读取对话上下文（由 checkpointer 持久化，跨进程有效）。"""
+        records = (state or {}).get("persisted_dialogue")
+        if not records:
             return ""
-
-    def _add_message_to_session(self, session_id: str, message: str, is_user: bool = True):
-        """添加消息到会话历史"""
-        try:
-            self.session_manager.add_message(session_id, message, is_user)
-        except Exception as e:
-            logger.warning("添加消息到会话时出错: %s", e)
+        trimmed = list(records)
+        # classify 节点在路由前已把当前用户轮次写入 persisted_dialogue，
+        # 而当前查询随后会作为独立问题发送给 LLM；剔除末尾的当前轮次，
+        # 避免同一问题在 prompt 中出现两遍
+        if trimmed and trimmed[-1].get("is_user", True):
+            trimmed = trimmed[:-1]
+        if not trimmed:
+            return ""
+        tail = trimmed[-max_messages:]
+        context_lines = []
+        for msg in tail:
+            role = "用户" if msg.get("is_user", True) else "AI"
+            content = msg.get("content", "")
+            timestamp = msg.get("timestamp", "")
+            context_lines.append(f"[{timestamp}] {role}: {content}")
+        return "\n".join(context_lines)
 
     def _enhance_system_prompt_with_context(self, base_prompt: str) -> str:
         """增强系统提示，添加对话上下文说明"""
