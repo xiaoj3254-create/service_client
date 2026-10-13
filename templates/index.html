@@ -2404,6 +2404,14 @@
         async function fetchHistoryInto(rt) {
             try {
                 const response = await fetch('/api/sessions/' + encodeURIComponent(rt.sid));
+                if (response.status === 403) {
+                    // 会话已失效（服务端身份轮换/会话已被删除）：关闭空 Tab + 刷新侧栏清掉死会话，
+                    // 避免每次点击都弹出「加载会话失败: HTTP 403」
+                    closeRuntime(rt.key, true);
+                    addSystemMessage('该会话已失效或无权访问，已自动从列表中移除');
+                    refreshSessionList();
+                    return;
+                }
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
