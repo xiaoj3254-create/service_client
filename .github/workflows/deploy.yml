@@ -38,6 +38,9 @@ jobs:
         with:
           context: .
           push: true
+          # 阿里云 ACR 不支持 buildx 默认附加的 provenance 认证清单
+          # （OCI empty manifest），必须显式关闭，否则推送被拒
+          provenance: false
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
