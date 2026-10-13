@@ -17,7 +17,7 @@ services:
   app:
     build: .
     # CI/CD：与 GitHub Actions deploy.yml 的 IMAGE 保持一致（可在 .env 覆盖 ACR_IMAGE）
-    image: ${ACR_IMAGE:-registry.cn-hangzhou.aliyuncs.com/xiaodf/cs-agent}:latest
+    image: ${ACR_IMAGE:-crpi-ok3wzukbukd4o6wq.cn-hangzhou.personal.cr.aliyuncs.com/xiaodf/cs-agent}:latest
     restart: unless-stopped
     env_file: .env
     environment:
