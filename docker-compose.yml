@@ -16,6 +16,8 @@ services:
 
   app:
     build: .
+    # CI/CD：与 GitHub Actions deploy.yml 的 IMAGE 保持一致（可在 .env 覆盖 ACR_IMAGE）
+    image: ${ACR_IMAGE:-registry.cn-hangzhou.aliyuncs.com/xiaodf/cs-agent}:latest
     restart: unless-stopped
     env_file: .env
     environment:
@@ -24,6 +26,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    labels:
+      # Watchtower 只重建带此标签的容器（nginx/postgres 不受影响）
+      com.centurylinklabs.watchtower.enable: "true"
     volumes:
       - chroma_data:/app/chroma_db   # RAG 向量库持久化
     expose:
@@ -33,6 +38,16 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # CD：轮询 ACR 发现新 latest 镜像后自动 pull 并仅重建带 label 的 app 容器
+  # 前置：服务器执行过 docker login <ACR域名>（凭据在 /root/.docker/config.json）
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /root/.docker/config.json:/config.json:ro
+    command: --label-enable --interval 60 --cleanup
 
   nginx:
     image: nginx:alpine

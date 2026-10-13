@@ -1,0 +1,45 @@
+# CD：main 分支 CI 通过后自动构建镜像并推送阿里云 ACR；
+# 服务器侧 Watchtower 检测到新 latest 自动拉取并仅重建 app 容器。
+# 回滚：docker tag <旧sha镜像> latest && docker compose up -d app
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}   # 支持任意分支手动触发（含 云部署）
+
+env:
+  # 在 GitHub Repo → Settings → Secrets and variables → Actions 中配置：
+  #   Variables: ACR_IMAGE（可选，默认杭州地域；格式 registry/命名空间/仓库名）
+  #   Secrets:   ACR_USERNAME / ACR_PASSWORD（ACR 个人版的固定密码）
+  IMAGE: ${{ vars.ACR_IMAGE || 'registry.cn-hangzhou.aliyuncs.com/xiaodf/cs-agent' }}
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    # workflow_run 触发时要求上游 CI 成功；手动触发无条件执行
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录阿里云 ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 构建并推送（latest + git sha 双标签）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
