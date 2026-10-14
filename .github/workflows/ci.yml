@@ -1,9 +1,10 @@
-# CI：推送/PR 即跑测试，红了拦截部署
+# CI：main 的 CI 是 Deploy 门禁（成功后触发 CD）；分支验证统一走 PR，
+# 避免「push 已跑 + PR 再跑」的同 commit 重复构建
 name: CI
 
 on:
   push:
-    branches: [main, "云部署"]
+    branches: [main]
   pull_request:
 
 jobs:
