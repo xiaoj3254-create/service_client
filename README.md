@@ -65,7 +65,6 @@ customer-service-ai-agent-main/
 ├── web_app.py                        # Flask 路由入口：/ 与 /api/* 路由、图片校验
 ├── config.py                         # 配置加载（从 .env 读取）
 ├── session_manager.py                # LangChainSessionManager：进程内会话管理（回退用）
-├── langgraph.json                    # LangGraph 平台配置（graph_id、节点、边、checkpointer TTL）
 ├── requirements.txt                  # Python 依赖
 ├── env_example.txt                   # 环境变量示例
 ├── .env                              # 实际环境变量（不要提交到仓库）

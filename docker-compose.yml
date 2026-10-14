@@ -23,6 +23,8 @@ services:
     environment:
       # checkpointer 与线程注册表共用 Postgres；compose 内固定指向 postgres 服务
       DATABASE_URL: postgresql://${POSTGRES_USER:-cs}:${POSTGRES_PASSWORD:-cs_pass_change_me}@postgres:5432/${POSTGRES_DB:-customer_service}
+      # SESSION_SECRET_KEY 未设置时，密钥文件落到挂载卷内（容器重建不丢失）
+      SESSION_SECRET_KEY_FILE: /app/session_keys/.flask_secret_key
     depends_on:
       postgres:
         condition: service_healthy
@@ -31,6 +33,7 @@ services:
       com.centurylinklabs.watchtower.enable: "true"
     volumes:
       - chroma_data:/app/chroma_db   # RAG 向量库持久化
+      - session_keys:/app/session_keys # 会话签名密钥持久化（镜像更新重建容器后用户会话不失效）
     expose:
       - "8000"                        # 仅 nginx 可达，不对宿主机开放
     healthcheck:
@@ -66,3 +69,4 @@ services:
 volumes:
   pgdata:
   chroma_data:
+  session_keys:

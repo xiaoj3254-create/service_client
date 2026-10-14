@@ -25,6 +25,8 @@ POSTGRES_DB=customer_service
 # ===== Session cookie =====
 # 生产必须设置强随机密钥（如 openssl rand -hex 32）
 SESSION_SECRET_KEY=your-strong-random-secret-here
+# 未设置 SESSION_SECRET_KEY 时，密钥落盘路径；容器部署须指向挂载卷（compose 已默认配置）
+# SESSION_SECRET_KEY_FILE=/app/session_keys/.flask_secret_key
 # 生产（HTTPS）开启
 SESSION_COOKIE_SECURE=False
 SESSION_SAME_SITE=lax
@@ -44,6 +46,11 @@ AINVOKE_TIMEOUT=120
 # ===== Sessions =====
 # 会话列表一次返回的最大线程数
 SESSION_LIST_LIMIT=30
+# 会话保留策略：updated_at 超过 N 天的会话（含 checkpoint 数据）由后台任务定期删除；0 = 永久保留
+SESSION_RETENTION_DAYS=90
+# 清理任务执行间隔（秒），默认 6 小时；单批最多删除 SESSION_CLEANUP_BATCH 个
+# SESSION_CLEANUP_INTERVAL_SECONDS=21600
+# SESSION_CLEANUP_BATCH=200
 
 # ===== RAG knowledge base (see scripts/build_knowledge_base.py) =====
 # embeddings 模型（SiliconFlow OpenAI 兼容 /embeddings 端点）
