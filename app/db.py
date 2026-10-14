@@ -137,7 +137,8 @@ class PgThreadsStore:
         if self._pool is None:
             from psycopg_pool import AsyncConnectionPool
             self._pool = AsyncConnectionPool(self._conninfo, min_size=1, max_size=10, open=False)
-            await self._pool.open(wait_ready=True)
+            # psycopg-pool 3.3 起 open() 的 wait_ready 参数更名为 wait（wait=True 阻塞至连接就绪）
+            await self._pool.open(wait=True)
         return self._pool
 
     async def get(self, thread_id: str, user_id: str) -> Optional[Dict[str, Any]]:
