@@ -13,8 +13,12 @@ RUN pip install --no-cache-dir -r requirements.lock.txt
 
 COPY . .
 
-# 非 root 运行；chroma_db / .flask_secret_key 由挂载卷或运行时生成
-RUN useradd -m appuser && chown -R appuser:appuser /app
+# 非 root 运行；chroma_db / session_keys 由挂载卷或运行时生成。
+# 预建挂载点并赋权：compose 命名卷首挂时继承镜像内目录属主，保证 appuser 可写
+# （漏建会导致卷属主为 root，非 root 进程报 sqlite code 14 unable to open database file）
+RUN useradd -m appuser \
+    && mkdir -p /app/chroma_db /app/session_keys \
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
